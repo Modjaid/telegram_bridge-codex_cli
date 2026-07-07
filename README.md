@@ -77,36 +77,35 @@ Examples:
 
 Switching workspace clears the saved Codex thread, pending answer mode, and bridge history for the global Telegram session. Follow-up plain text messages continue in the selected workspace until another workspace command is used.
 
-## CollabMD HTTP Adapter
+## CollabMD
 
-Enable it in `.env`:
+You can also connect CollabMD, a convenient tool for working with Markdown files on a VPS.
 
-```bash
-COLLABMD_ADAPTER_ENABLED=true
-COLLABMD_BRIDGE_HOST=127.0.0.1
-COLLABMD_BRIDGE_PORT=17891
-COLLABMD_BRIDGE_TOKEN=change-me
+## Inbox And File Handling
+
+Telegram photo/image, audio/voice, video, animation, video note, and document uploads are saved into `Inbox` under the current Telegram workspace. The bridge creates the folder when it does not exist. Use `MAX_INBOX_FILE_BYTES` to adjust the per-file download limit.
+
+The uploaded file content is stored as a normal file:
+
+```text
+<workspace>/Inbox/<telegram-file-name>
 ```
 
-Submit every UI message to the bridge:
+If a file with the same name already exists, the bridge writes a unique filename instead of overwriting the old file.
 
-```bash
-curl -sS -X POST http://127.0.0.1:17891/v1/messages \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer change-me' \
-  -d '{"sessionId":"vault-main","userId":"summer","author":"Summer","text":"/codex --history update docs"}'
+Metadata is stored separately from the file content in the media index:
+
+```text
+<workspace>/Inbox/.media-index.json
 ```
 
-Fetch bridge output for the same session:
+The index stores the bridge `mediaId`, Telegram chat/message/file ids, media type, MIME type, local path, size, SHA-256, caption, creation/save dates, and an agent-editable description field. Missing local files are pruned synchronously when the bridge or helper commands update the index.
 
-```bash
-curl -sS -H 'Authorization: Bearer change-me' \
-  'http://127.0.0.1:17891/v1/sessions/vault-main/outbox?after=0'
-```
+After saving an upload, the bridge sends the file back to Telegram with inline `Info` and `Delete` controls. That echo message is also linked to the same `mediaId`, so a later Telegram reply to the original upload or to the echo can be resolved back to the local Inbox file.
 
-Messages without a bridge command return `accepted: false` and remain available as dialog history for a later `--history` command.
+When a user replies to an Inbox media message with a Codex command, the bridge adds a `Telegram reply media` block to the Codex prompt. That block contains the local path, `mediaId`, index path, file type, MIME type, size, SHA-256, caption, and description status, so Codex can inspect or move the saved file from the workspace.
 
-Telegram `.json` document uploads are downloaded into `JSON_UPLOAD_DIR` (`/tmp/codex-telegram-upload` by default). They are sent to Codex only when the caption contains a bridge command, for example:
+Telegram `.json` document uploads are also copied into `JSON_UPLOAD_DIR` (`/tmp/codex-telegram-upload` by default). They are sent to Codex only when the caption contains a bridge command, for example:
 
 ```text
 /codex inspect this snapshot
@@ -118,16 +117,6 @@ Optional JSON upload settings:
 JSON_UPLOAD_DIR=/tmp/codex-telegram-upload
 MAX_JSON_BYTES=10000000
 ```
-
-Telegram photo/image, audio/voice, and document uploads are also saved into `Inbox` under the current Telegram workspace. The bridge creates the folder when it does not exist. Use `MAX_INBOX_FILE_BYTES` to adjust the per-file download limit.
-
-Every Inbox upload is also recorded in the current workspace media index:
-
-```text
-<workspace>/Inbox/.media-index.json
-```
-
-The index stores the bridge `mediaId`, Telegram chat/message/file ids, media type, MIME type, local path, size, SHA-256, caption, creation/save dates, and an agent-editable description field. Missing local files are pruned synchronously when the bridge or helper commands update the index.
 
 Codex runs launched by the bridge get `scripts/` prepended to `PATH`, so agents can use the media helper from any workspace:
 
