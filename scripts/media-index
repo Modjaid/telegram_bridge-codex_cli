@@ -1,0 +1,284 @@
+#!/usr/bin/env node
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import {
+  addTelegramMessageAlias,
+  createLocalMediaRecord,
+  deleteMediaItem,
+  findMediaByTelegramMessage,
+  getMediaFilePath,
+  getMediaItem,
+  initMediaIndex,
+  listMediaItems,
+  mediaIndexPath,
+  moveMediaItem,
+  setMediaDescription,
+  syncMediaIndex,
+  upsertMediaRecord,
+  validateMediaIndex,
+} from "../src/media-index.js";
+
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+loadDotEnv(path.join(ROOT, ".env"));
+
+const { command, args, options } = parseArgs(process.argv.slice(2));
+
+try {
+  const workspace = options.workspace || process.cwd();
+  let result;
+  switch (command) {
+    case "init":
+      result = initMediaIndex(workspace);
+      print(options, { ok: true, path: mediaIndexPath(workspace), count: Object.keys(result.items).length });
+      break;
+    case "list":
+      result = listMediaItems(workspace, { sync: true });
+      printList(options, result);
+      break;
+    case "pending":
+      result = listMediaItems(workspace, { sync: true, status: "pending" });
+      printList(options, result);
+      break;
+    case "show":
+      requireArgs(args, 1, "show <mediaId>");
+      result = getMediaItem(workspace, args[0], { sync: true });
+      if (!result) fail(`Media item not found: ${args[0]}`);
+      print(options, result);
+      break;
+    case "find-telegram":
+      requireOption(options, "chat-id");
+      requireOption(options, "message-id");
+      result = findMediaByTelegramMessage(workspace, options["chat-id"], options["message-id"], { sync: true });
+      if (!result) fail(`Media item not found for Telegram message: ${options["chat-id"]}:${options["message-id"]}`);
+      print(options, result);
+      break;
+    case "describe": {
+      requireArgs(args, 1, "describe <mediaId> (--text <description>|--stdin)");
+      const description = options.stdin ? await readStdin() : options.text;
+      if (description === undefined) fail("Pass --text <description> or --stdin.");
+      result = setMediaDescription(workspace, args[0], description);
+      print(options, result);
+      break;
+    }
+    case "delete":
+      requireArgs(args, 1, "delete <mediaId>");
+      result = deleteMediaItem(workspace, args[0]);
+      print(options, result);
+      break;
+    case "move":
+      requireArgs(args, 1, "move <mediaId> --to <path>");
+      requireOption(options, "to");
+      result = moveMediaItem(workspace, args[0], options.to, { overwrite: !!options.overwrite });
+      print(options, result);
+      break;
+    case "send":
+      requireArgs(args, 1, "send <mediaId|path>");
+      result = await sendMedia(workspace, args[0], options);
+      print(options, result);
+      break;
+    case "sync":
+      result = syncMediaIndex(workspace);
+      print(options, { ok: true, removed: result.removed, count: Object.keys(result.index.items).length, path: mediaIndexPath(workspace) });
+      break;
+    case "validate":
+      result = validateMediaIndex(workspace);
+      print(options, result);
+      if (!result.ok) process.exitCode = 1;
+      break;
+    case "help":
+    case "":
+      usage();
+      break;
+    default:
+      fail(`Unknown command: ${command}`);
+  }
+} catch (error) {
+  fail(error.message);
+}
+
+function parseArgs(argv) {
+  const command = argv.shift() || "";
+  const args = [];
+  const options = {};
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (!token.startsWith("--")) {
+      args.push(token);
+      continue;
+    }
+    const name = token.slice(2);
+    if (name === "json" || name === "stdin" || name === "overwrite") {
+      options[name] = true;
+      continue;
+    }
+    const value = argv[i + 1];
+    if (value === undefined || value.startsWith("--")) fail(`Missing value for --${name}`);
+    options[name] = value;
+    i += 1;
+  }
+  return { command, args, options };
+}
+
+function printList(options, items) {
+  if (options.json) {
+    print(options, items);
+    return;
+  }
+  for (const item of items) {
+    console.log([
+      item.mediaId,
+      item.file?.mediaType || "file",
+      item.descriptionStatus || "pending",
+      item.file?.relativePath || item.file?.path || "",
+    ].join("\t"));
+  }
+}
+
+function print(options, value) {
+  if (options.json) console.log(JSON.stringify(value, null, 2));
+  else if (Array.isArray(value)) printList(options, value);
+  else console.log(JSON.stringify(value, null, 2));
+}
+
+async function sendMedia(workspace, target, options) {
+  const token = process.env.BOT_TOKEN || "";
+  if (!token) fail("BOT_TOKEN is required. Run this from the bridge environment or keep codex-telegram-bridge/.env readable.");
+
+  const item = resolveSendItem(workspace, target, options);
+  const filePath = getMediaFilePath(workspace, item);
+  const chatId = String(options["chat-id"] || item.telegram?.chatId || firstAllowedUserId() || "").trim();
+  if (!chatId) fail("Missing destination chat. Pass --chat-id <id> or set ALLOWED_USER_IDS.");
+
+  const message = await sendTelegramDocument({
+    token,
+    chatId,
+    filePath,
+    mimeType: item.file?.mimeType || "application/octet-stream",
+    caption: options.caption !== undefined ? options.caption : formatSendCaption(item),
+    replyMarkup: mediaKeyboard(item.mediaId),
+  });
+  const updated = addTelegramMessageAlias(workspace, item.mediaId, chatId, message.message_id);
+
+  return {
+    ok: true,
+    mediaId: item.mediaId,
+    chatId,
+    messageId: String(message.message_id || ""),
+    file: filePath,
+    item: updated,
+  };
+}
+
+function resolveSendItem(workspace, target, options) {
+  const existing = getMediaItem(workspace, target, { sync: true });
+  if (existing) return existing;
+
+  const workspacePath = path.resolve(workspace);
+  const candidate = path.isAbsolute(target) ? path.resolve(target) : path.resolve(workspacePath, target);
+  if (!existsSync(candidate)) fail(`Media item or file not found: ${target}`);
+
+  return upsertMediaRecord(workspacePath, createLocalMediaRecord({
+    workspace: workspacePath,
+    filePath: candidate,
+    caption: options.caption || "",
+  })).item;
+}
+
+async function sendTelegramDocument({ token, chatId, filePath, mimeType, caption, replyMarkup }) {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("document", new Blob([readFileSync(filePath)], { type: mimeType }), path.basename(filePath));
+  form.append("caption", truncate(caption, 1000));
+  form.append("reply_markup", JSON.stringify(replyMarkup));
+
+  const res = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+    method: "POST",
+    body: form,
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok || !body?.ok) {
+    throw new Error(`Telegram sendDocument failed: ${res.status} ${JSON.stringify(body)}`);
+  }
+  return body.result;
+}
+
+function mediaKeyboard(mediaId) {
+  return {
+    inline_keyboard: [[
+      { text: "Info", callback_data: `media:info:${mediaId}` },
+      { text: "Delete", callback_data: `media:delete:${mediaId}` },
+    ]],
+  };
+}
+
+function formatSendCaption(item) {
+  return [
+    "Media file",
+    `mediaId: ${item.mediaId}`,
+    `type: ${item.file?.mediaType || "file"}`,
+    `file: ${item.file?.relativePath || item.file?.path || ""}`,
+    `description: ${item.descriptionStatus || "pending"}`,
+    item.description ? `description text: ${item.description}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+function firstAllowedUserId() {
+  return String(process.env.ALLOWED_USER_IDS || "").split(",").map(item => item.trim()).filter(Boolean)[0] || "";
+}
+
+function truncate(text, limit) {
+  const value = String(text || "");
+  if (value.length <= limit) return value;
+  return `${value.slice(0, Math.max(0, limit - 3))}...`;
+}
+
+function requireArgs(args, count, syntax) {
+  if (args.length < count) fail(`Usage: media-index ${syntax}`);
+}
+
+function requireOption(options, name) {
+  if (!options[name]) fail(`Missing --${name}`);
+}
+
+function readStdin() {
+  return new Promise(resolve => {
+    let data = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", chunk => { data += chunk; });
+    process.stdin.on("end", () => resolve(data));
+  });
+}
+
+function usage() {
+  console.log(`Usage:
+  media-index init --workspace <path>
+  media-index list --workspace <path> [--json]
+  media-index pending --workspace <path> [--json]
+  media-index show <mediaId> --workspace <path> [--json]
+  media-index find-telegram --chat-id <id> --message-id <id> --workspace <path> [--json]
+  media-index describe <mediaId> --workspace <path> (--text <description>|--stdin) [--json]
+  media-index delete <mediaId> --workspace <path> [--json]
+  media-index move <mediaId> --workspace <path> --to <path> [--overwrite] [--json]
+  media-index send <mediaId|path> --workspace <path> [--chat-id <id>] [--caption <text>] [--json]
+  media-index sync --workspace <path> [--json]
+  media-index validate --workspace <path> [--json]`);
+}
+
+function loadDotEnv(file) {
+  if (!existsSync(file)) return;
+  const data = readFileSync(file, "utf8");
+  for (const rawLine of data.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) continue;
+    const [, key, rawValue] = match;
+    if (process.env[key] !== undefined) continue;
+    process.env[key] = rawValue.replace(/^["']|["']$/g, "");
+  }
+}
+
+function fail(message) {
+  console.error(message);
+  process.exit(1);
+}

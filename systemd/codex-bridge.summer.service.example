@@ -1,0 +1,19 @@
+[Unit]
+Description=Codex Bridge for Summer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/summer/codex-telegram-bridge
+ExecStart=/usr/bin/node /home/summer/codex-telegram-bridge/src/bot.js
+EnvironmentFile=/home/summer/codex-telegram-bridge/.env
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/summer /tmp
+
+[Install]
+WantedBy=default.target

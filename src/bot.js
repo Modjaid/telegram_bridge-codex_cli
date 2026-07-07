@@ -1,0 +1,1898 @@
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import http from "node:http";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import {
+  addTelegramMessageAlias,
+  createTelegramMediaRecord,
+  deleteMediaItem,
+  findMediaWorkspace,
+  getMediaItem,
+  MEDIA_INDEX_RELATIVE_PATH,
+  peekMediaByTelegramMessage,
+  upsertMediaRecord,
+} from "./media-index.js";
+
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const STATE_DIR = path.join(ROOT, "state");
+const STATE_FILE = path.join(STATE_DIR, "state.json");
+
+loadDotEnv(path.join(ROOT, ".env"));
+
+const config = {
+  telegramEnabled: parseBool(process.env.TELEGRAM_ADAPTER_ENABLED || (process.env.BOT_TOKEN ? "true" : "false")),
+  botToken: process.env.BOT_TOKEN || "",
+  allowedUserIds: csv(process.env.ALLOWED_USER_IDS).map(Number).filter(Boolean),
+  workspaces: csv(process.env.WORKSPACE_ALLOWLIST).map(p => path.resolve(p)),
+  workspaceCommandSpec: process.env.WORKSPACE_COMMANDS || "",
+  codexBin: process.env.CODEX_BIN || "codex",
+  defaultModel: process.env.CODEX_MODEL || "",
+  defaultSandbox: process.env.CODEX_SANDBOX || "workspace-write",
+  defaultApprovalPolicy: process.env.CODEX_APPROVAL_POLICY || "on-request",
+  skipGitRepoCheck: parseBool(process.env.CODEX_SKIP_GIT_REPO_CHECK || "false"),
+  envAllowlist: csv(process.env.CODEX_ENV_ALLOWLIST || "PATH,HOME,USER,LANG,LC_ALL,TERM,CODEX_HOME"),
+  pollTimeoutSeconds: Number(process.env.POLL_TIMEOUT_SECONDS || 25),
+  liveUpdateIntervalMs: Number(process.env.LIVE_UPDATE_INTERVAL_MS || 2000),
+  maxTelegramChars: Number(process.env.MAX_TELEGRAM_CHARS || 3900),
+  sttCommand: process.env.STT_COMMAND || "",
+  sttTimeoutMs: Number(process.env.STT_TIMEOUT_MS || 120000),
+  maxAudioBytes: Number(process.env.MAX_AUDIO_BYTES || 20000000),
+  maxInboxFileBytes: Number(process.env.MAX_INBOX_FILE_BYTES || 50000000),
+  jsonUploadDir: path.resolve(process.env.JSON_UPLOAD_DIR || path.join(tmpdir(), "codex-telegram-upload")),
+  maxJsonBytes: Number(process.env.MAX_JSON_BYTES || 10000000),
+  bridgeCommands: csv(process.env.BRIDGE_COMMANDS || "/codex,@codex,codex:"),
+  includeHistoryByDefault: parseBool(process.env.CODEX_INCLUDE_HISTORY_BY_DEFAULT || "false"),
+  maxHistoryMessages: Number(process.env.BRIDGE_MAX_HISTORY_MESSAGES || 40),
+  collabmdEnabled: parseBool(process.env.COLLABMD_ADAPTER_ENABLED || "false"),
+  collabmdHost: process.env.COLLABMD_BRIDGE_HOST || "127.0.0.1",
+  collabmdPort: Number(process.env.COLLABMD_BRIDGE_PORT || 17891),
+  collabmdToken: process.env.COLLABMD_BRIDGE_TOKEN || "",
+  maxHttpBodyBytes: Number(process.env.BRIDGE_MAX_HTTP_BODY_BYTES || 1000000),
+};
+
+if (config.telegramEnabled && !config.botToken) {
+  throw new Error("BOT_TOKEN is required when TELEGRAM_ADAPTER_ENABLED=true");
+}
+if (config.telegramEnabled && config.allowedUserIds.length === 0) {
+  throw new Error("ALLOWED_USER_IDS must contain at least one numeric Telegram user id");
+}
+if (config.workspaces.length === 0) {
+  throw new Error("WORKSPACE_ALLOWLIST must contain at least one absolute workspace path");
+}
+for (const workspace of config.workspaces) {
+  if (!existsSync(workspace)) throw new Error(`Workspace does not exist: ${workspace}`);
+}
+config.workspaceCommands = parseWorkspaceCommandSpec(config.workspaceCommandSpec, config.workspaces);
+
+const apiBase = config.botToken ? `https://api.telegram.org/bot${config.botToken}` : "";
+const state = loadState();
+const running = new Map();
+let offset = Number(state.offset || 0);
+const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"];
+const APPROVAL_POLICIES = ["untrusted", "on-request", "on-failure", "never"];
+
+console.log("Codex Bridge started");
+console.log(`Telegram adapter: ${config.telegramEnabled ? "enabled" : "disabled"}`);
+if (config.telegramEnabled) console.log(`Allowed Telegram users: ${config.allowedUserIds.join(", ")}`);
+console.log(`Default workspace: ${config.workspaces[0]}`);
+console.log(`Workspace commands: ${formatWorkspaceCommands(config.workspaceCommands) || "none"}`);
+console.log(`Bridge commands: ${config.bridgeCommands.join(", ")}`);
+if (config.collabmdEnabled) startCollabmdHttpAdapter();
+if (config.telegramEnabled) await runTelegramAdapter();
+
+async function runTelegramAdapter() {
+  await syncTelegramCommandMenu();
+
+  while (true) {
+    try {
+      const updates = await telegram("getUpdates", {
+        offset,
+        timeout: config.pollTimeoutSeconds,
+        allowed_updates: ["message", "callback_query"],
+      });
+
+      for (const update of updates) {
+        offset = update.update_id + 1;
+        state.offset = offset;
+        saveState();
+        await handleUpdate(update);
+      }
+    } catch (error) {
+      console.error("poll error", error);
+      await sleep(2000);
+    }
+  }
+}
+
+async function syncTelegramCommandMenu() {
+  const commands = [
+    { command: "commands", description: "List workspace commands" },
+  ];
+  const scopes = [
+    { label: "default", payload: {} },
+    { label: "all_private_chats", payload: { scope: { type: "all_private_chats" } } },
+    ...config.allowedUserIds.map(chatId => ({
+      label: `chat:${chatId}`,
+      payload: { scope: { type: "chat", chat_id: chatId } },
+    })),
+  ];
+
+  for (const scope of scopes) {
+    try {
+      await telegram("deleteMyCommands", scope.payload);
+    } catch (error) {
+      console.warn(`Failed to delete Telegram commands for ${scope.label}: ${error.message}`);
+    }
+  }
+
+  for (const scope of scopes) {
+    try {
+      await telegram("setMyCommands", { ...scope.payload, commands });
+    } catch (error) {
+      console.warn(`Failed to set Telegram commands for ${scope.label}: ${error.message}`);
+    }
+  }
+
+  console.log("Telegram command menu synced: /commands");
+}
+
+async function handleUpdate(update) {
+  if (update.callback_query) return handleCallback(update.callback_query);
+  if (update.message) return handleMessage(update.message);
+}
+
+async function handleCallback(query) {
+  const userId = query.from?.id;
+  const chatId = query.message?.chat?.id;
+  if (!isAllowed(userId)) {
+    await answerCallback(query.id, "Access denied");
+    return;
+  }
+
+  const data = query.data || "";
+  const target = telegramTarget(chatId);
+  const session = getSession(target.key);
+
+  if (data.startsWith("media:")) {
+    await handleMediaCallback(query, data);
+    return;
+  }
+
+  if (data.startsWith("sandbox:")) {
+    const sandbox = data.slice("sandbox:".length);
+    if (!SANDBOX_MODES.includes(sandbox)) {
+      await answerCallback(query.id, "Unknown sandbox");
+      return;
+    }
+    session.sandbox = sandbox;
+    saveState();
+    await answerCallback(query.id, `Sandbox: ${session.sandbox}`);
+    await editMessage(query.message, statusText(target.key), statusKeyboard());
+    return;
+  }
+
+  if (data.startsWith("approval:")) {
+    const approvalPolicy = data.slice("approval:".length);
+    if (!APPROVAL_POLICIES.includes(approvalPolicy)) {
+      await answerCallback(query.id, "Unknown approval policy");
+      return;
+    }
+    session.approvalPolicy = approvalPolicy;
+    saveState();
+    await answerCallback(query.id, `Approval: ${session.approvalPolicy}`);
+    await editMessage(query.message, statusText(target.key), statusKeyboard());
+    return;
+  }
+
+  if (data.startsWith("repo:")) {
+    const index = Number(data.slice("repo:".length));
+    if (Number.isInteger(index) && config.workspaces[index]) {
+      switchSessionWorkspace(session, config.workspaces[index]);
+      saveState();
+      await answerCallback(query.id, "Workspace selected");
+      await editMessage(query.message, statusText(target.key), statusKeyboard());
+    } else {
+      await answerCallback(query.id, "Unknown workspace");
+    }
+    return;
+  }
+
+  if (data === "stop") {
+    await answerCallback(query.id, "Stopping");
+    await stopRun(target);
+    return;
+  }
+
+  if (data === "status") {
+    await answerCallback(query.id, "Status");
+    await editMessage(query.message, statusText(target.key), statusKeyboard());
+    return;
+  }
+
+  if (data === "answer:custom") {
+    session.pendingAnswer = true;
+    saveState();
+    await answerCallback(query.id, "Waiting for your text answer");
+    await sendMessage(chatId, "Send your answer as the next message. I will pass it back to Codex in the same thread.");
+    return;
+  }
+
+  if (data === "answer:assume") {
+    delete session.pendingAnswer;
+    saveState();
+    await answerCallback(query.id, "Continuing");
+    await runCodex(target, "Make a reasonable assumption, state it briefly, and continue.");
+    return;
+  }
+
+  await answerCallback(query.id, "Unknown action");
+}
+
+async function handleMediaCallback(query, data) {
+  const chatId = query.message?.chat?.id;
+  const [, action, mediaId] = data.split(":");
+  console.log(`media callback received: action=${action || ""} mediaId=${mediaId || ""} chat=${chatId || ""} from=${query.from?.id || ""} message=${query.message?.message_id || ""}`);
+  if (!mediaId) {
+    await answerCallback(query.id, "Missing media id");
+    return;
+  }
+
+  try {
+    const found = findMediaWorkspace(config.workspaces, mediaId);
+    console.log(`media callback lookup: action=${action || ""} mediaId=${mediaId} found=${found ? "yes" : "no"} workspace=${found?.workspace || ""}`);
+    if (action === "info") {
+      if (!found) {
+        console.log(`media info not found: mediaId=${mediaId}`);
+        await answerCallback(query.id, "Media not found");
+        await editMediaCallbackMessage(query.message, `Media not found or already removed:\n${mediaId}`, undefined);
+        return;
+      }
+      await answerCallback(query.id, "Info");
+      await editMediaCallbackMessage(query.message, formatMediaInfo(found.workspace, found.item), mediaKeyboard(mediaId));
+      console.log(`media info shown: mediaId=${mediaId} workspace=${found.workspace}`);
+      return;
+    }
+
+    if (action === "delete") {
+      if (!found) {
+        console.log(`media delete not found: mediaId=${mediaId}`);
+        await answerCallback(query.id, "Already removed");
+        await editMediaCallbackMessage(query.message, `File already removed from storage:\n${mediaId}`, undefined);
+        return;
+      }
+      const result = deleteMediaItem(found.workspace, mediaId);
+      console.log(`media delete result: mediaId=${mediaId} workspace=${found.workspace} deleted=${result.deleted} fileDeleted=${result.fileDeleted} file=${result.filePath || ""}`);
+      await answerCallback(query.id, result.deleted ? "Deleted" : "Already removed");
+      await editMediaCallbackMessage(query.message, [
+        "File deleted from storage.",
+        `mediaId: ${mediaId}`,
+        result.filePath ? `file: ${result.filePath}` : "",
+        `workspace: ${found.workspace}`,
+      ].filter(Boolean).join("\n"), undefined);
+      return;
+    }
+
+    console.log(`unknown media action: action=${action || ""} mediaId=${mediaId}`);
+    await answerCallback(query.id, "Unknown media action");
+    if (chatId) await sendMessage(chatId, `Unknown media action: ${action || ""}`);
+  } catch (error) {
+    console.error(`media callback failed: action=${action || ""} mediaId=${mediaId} error=${error.stack || error.message}`);
+    await answerCallback(query.id, `Media action failed: ${error.message}`).catch(() => {});
+  }
+}
+
+async function handleMessage(message) {
+  const chatId = message.chat.id;
+  const target = telegramTarget(chatId);
+  const userId = message.from?.id;
+  if (!isAllowed(userId)) {
+    await sendMessage(chatId, "Access denied.");
+    return;
+  }
+
+  const text = (message.text || "").trim();
+  const audio = getAudioAttachment(message);
+  const jsonDocument = getJsonDocumentAttachment(message);
+  const inboxAttachment = getInboxAttachment(message);
+  if (!text && !audio && !jsonDocument && !inboxAttachment) return;
+
+  const session = getSession(target.key);
+  let inboxPath = "";
+  let inboxRecord = null;
+  let inboxEchoSent = false;
+  if (inboxAttachment) {
+    try {
+      inboxPath = await saveInboxAttachment(session, inboxAttachment);
+      inboxRecord = recordInboxMedia(session, message, inboxAttachment, inboxPath);
+    } catch (error) {
+      await sendMessage(chatId, `Failed to save media to Inbox: ${error.message}`);
+      return;
+    }
+    try {
+      const echoMessage = await sendInboxMediaMessage(chatId, inboxRecord);
+      recordInboxEchoMessage(session, inboxRecord, echoMessage);
+      inboxEchoSent = true;
+    } catch (error) {
+      await sendMessage(chatId, `Saved to Inbox, but failed to send media controls: ${error.message}\n\n${formatSavedInboxMessage(inboxRecord, inboxPath)}`);
+    }
+  }
+  if (audio) {
+    await handleAudioMessage(target, session, audio, inboxPath, inboxRecord);
+    return;
+  }
+  if (jsonDocument) {
+    await handleJsonDocumentMessage(target, session, jsonDocument, message.caption || "", inboxPath, inboxRecord);
+    return;
+  }
+  if (inboxPath && !text) {
+    appendHistory(session, {
+      role: "user",
+      text: `Uploaded ${inboxAttachment.mediaType}: ${inboxPath}`,
+      adapter: "telegram",
+      userId: String(userId || ""),
+      media: inboxAttachment.mediaType,
+      attachmentPath: inboxPath,
+      mediaId: inboxRecord?.mediaId || "",
+      messageId: String(message.message_id || ""),
+      at: new Date().toISOString(),
+    });
+    saveState();
+    if (!inboxEchoSent) await sendMessage(chatId, formatSavedInboxMessage(inboxRecord, inboxPath));
+    return;
+  }
+  let replyInboxContext = null;
+  if (text) {
+    try {
+      replyInboxContext = await getReplyInboxContext(session, message);
+    } catch (error) {
+      await sendMessage(chatId, `Файл из reply не найден в Inbox: ${error.message}`);
+      return;
+    }
+  }
+
+  appendHistory(session, {
+    role: "user",
+    text,
+    adapter: "telegram",
+    userId: String(userId || ""),
+    at: new Date().toISOString(),
+  });
+  saveState();
+
+  if (session.pendingAnswer && !text.startsWith("/")) {
+    delete session.pendingAnswer;
+    saveState();
+    await runCodex(target, buildTextPrompt(`User answer to your previous question:\n\n${text}`, replyInboxContext));
+    return;
+  }
+
+  const workspaceCommand = parseWorkspaceCommand(text);
+  if (workspaceCommand) {
+    await handleWorkspaceCommand(target, session, workspaceCommand);
+    return;
+  }
+
+  const bridgeCommand = parseBridgeCommand(text);
+  if (bridgeCommand) {
+    if (!bridgeCommand.prompt) {
+      await sendMessage(chatId, `Usage: ${config.bridgeCommands[0]} <task>\nAdd --history when Codex needs recent dialog context.`);
+      return;
+    }
+    await runCodex(target, buildPrompt(session, bridgeCommand, text, replyInboxContext));
+    return;
+  }
+
+  if (text.startsWith("/")) {
+    await handleCommand(target, text);
+    return;
+  }
+
+  await runCodex(target, buildTextPrompt(text, replyInboxContext));
+}
+
+async function handleCommand(target, text) {
+  const chatId = target.chatId;
+  const [command, ...rest] = text.split(/\s+/);
+  const arg = rest.join(" ").trim();
+
+  switch (command) {
+    case "/start":
+    case "/help":
+      await sendMessage(chatId, helpText(), { reply_markup: statusKeyboard() });
+      return;
+    case "/status":
+      await sendMessage(chatId, statusText(target.key), { reply_markup: statusKeyboard() });
+      return;
+    case "/new": {
+      const session = getSession(target.key);
+      delete session.threadId;
+      saveState();
+      await sendMessage(chatId, "New Codex thread will be started on the next message.");
+      return;
+    }
+    case "/resume": {
+      const session = getSession(target.key);
+      await sendMessage(chatId, session.threadId ? `Will resume thread:\n${session.threadId}` : "No saved thread id yet.");
+      return;
+    }
+    case "/stop":
+      await stopRun(target);
+      return;
+    case "/cancel": {
+      const session = getSession(target.key);
+      delete session.pendingAnswer;
+      saveState();
+      await sendMessage(chatId, "Pending answer mode cleared.");
+      return;
+    }
+    case "/repo":
+      await sendMessage(chatId, "Choose workspace:", { reply_markup: repoKeyboard() });
+      return;
+    case "/commands":
+      await sendMessage(chatId, workspaceCommandsText());
+      return;
+    case "/model": {
+      const session = getSession(target.key);
+      if (arg) {
+        session.model = arg;
+        saveState();
+      }
+      await sendMessage(chatId, `Model: ${session.model || config.defaultModel || "Codex default"}`);
+      return;
+    }
+    case "/sandbox": {
+      const session = getSession(target.key);
+      if (arg) {
+        if (!SANDBOX_MODES.includes(arg)) {
+          await sendMessage(chatId, `Allowed: /sandbox ${SANDBOX_MODES.join("|")}`);
+          return;
+        }
+        session.sandbox = arg;
+        saveState();
+      }
+      await sendMessage(chatId, `Sandbox: ${session.sandbox || config.defaultSandbox}`, { reply_markup: sandboxKeyboard() });
+      return;
+    }
+    case "/approval": {
+      const session = getSession(target.key);
+      if (arg) {
+        if (!APPROVAL_POLICIES.includes(arg)) {
+          await sendMessage(chatId, `Allowed: /approval ${APPROVAL_POLICIES.join("|")}`);
+          return;
+        }
+        session.approvalPolicy = arg;
+        saveState();
+      }
+      await sendMessage(chatId, `Approval: ${session.approvalPolicy || config.defaultApprovalPolicy}`, { reply_markup: approvalKeyboard() });
+      return;
+    }
+    case "/diff":
+      await runCodex(target, "Review the current git diff and summarize the important changes and risks. Do not modify files.");
+      return;
+    default:
+      await sendMessage(chatId, `Unknown command: ${command}\n\n${helpText()}`);
+  }
+}
+
+async function handleWorkspaceCommand(target, session, workspaceCommand) {
+  const chatId = target.chatId;
+  const currentWorkdir = session.workdir || config.workspaces[0];
+  const switched = currentWorkdir !== workspaceCommand.workdir;
+
+  if (switched) {
+    const run = running.get(target.key);
+    if (run) {
+      run.replaced = true;
+      running.delete(target.key);
+      run.child.kill("SIGTERM");
+      setTimeout(() => {
+        if (!run.child.killed) run.child.kill("SIGKILL");
+      }, 3000).unref();
+    }
+    switchSessionWorkspace(session, workspaceCommand.workdir);
+    saveState();
+  }
+
+  if (!workspaceCommand.prompt) {
+    await sendMessage(chatId, switched
+      ? `Workspace switched to /${workspaceCommand.alias}:\n${workspaceCommand.workdir}`
+      : `Already in /${workspaceCommand.alias}:\n${workspaceCommand.workdir}`);
+    return;
+  }
+
+  if (switched) {
+    await sendMessage(chatId, `Workspace switched to /${workspaceCommand.alias}:\n${workspaceCommand.workdir}`);
+  }
+  await runCodex(target, workspaceCommand.prompt);
+}
+
+async function runCodex(target, prompt) {
+  if (running.has(target.key)) {
+    await sendBridgeMessage(target, "A Codex turn is already running for this session. Use /stop to cancel it.");
+    return;
+  }
+
+  const session = getSession(target.key);
+  const workdir = session.workdir || config.workspaces[0];
+  const sandbox = session.sandbox || config.defaultSandbox;
+  const approvalPolicy = session.approvalPolicy || config.defaultApprovalPolicy;
+  const model = session.model || config.defaultModel;
+
+  const args = ["-a", approvalPolicy, "exec", "--json", "--sandbox", sandbox];
+  if (model) args.push("--model", model);
+  if (config.skipGitRepoCheck) args.push("--skip-git-repo-check");
+  if (session.threadId) args.push("resume", session.threadId, prompt);
+  else args.push(prompt);
+
+  const live = {
+    target,
+    messageId: null,
+    lines: [],
+    final: "",
+    lastEdit: 0,
+    threadId: session.threadId || "",
+  };
+
+  const startMessage = await sendBridgeMessage(target, `Starting Codex in:\n${workdir}\n\nSandbox: ${sandbox}\nApproval: ${approvalPolicy}`);
+  live.messageId = startMessage.message_id;
+
+  const child = spawn(config.codexBin, args, {
+    cwd: workdir,
+    env: childEnv(),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  const run = { child, live, replaced: false };
+  running.set(target.key, run);
+
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+
+  let stdoutBuffer = "";
+  child.stdout.on("data", chunk => {
+    stdoutBuffer += chunk;
+    const lines = stdoutBuffer.split(/\r?\n/);
+    stdoutBuffer = lines.pop() || "";
+    for (const line of lines) handleJsonLine(live, session, line);
+  });
+
+  child.stderr.on("data", chunk => {
+    addLive(live, `stderr: ${clean(chunk).slice(0, 500)}`);
+    void flushLive(live, false);
+  });
+
+  child.on("error", error => {
+    addLive(live, `process error: ${error.message}`);
+  });
+
+  child.on("close", async code => {
+    if (run.replaced) return;
+    if (stdoutBuffer.trim()) handleJsonLine(live, session, stdoutBuffer.trim());
+    if (running.get(target.key)?.child === child) running.delete(target.key);
+    saveState();
+    addLive(live, code === 0 ? "completed" : `failed with exit code ${code}`);
+    await flushLive(live, true);
+    if (live.final) {
+      appendHistory(session, {
+        role: "assistant",
+        text: live.final,
+        adapter: "codex",
+        at: new Date().toISOString(),
+      });
+      saveState();
+      await sendBridgeLong(target, live.final);
+      if (looksLikeQuestion(live.final)) {
+        await sendBridgeMessage(target, "Codex seems to be waiting for your answer.", { reply_markup: answerKeyboard() });
+      }
+    } else if (code !== 0) {
+      const failure = live.lines.slice(-6).join("\n") || `Codex failed with exit code ${code}`;
+      await sendBridgeMessage(target, `Codex failed.\n\n${failure}`);
+    }
+  });
+}
+
+function handleJsonLine(live, session, line) {
+  if (!line.trim()) return;
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    addLive(live, `output: ${clean(line).slice(0, 500)}`);
+    void flushLive(live, false);
+    return;
+  }
+
+  switch (event.type) {
+    case "thread.started":
+      session.threadId = event.thread_id;
+      live.threadId = event.thread_id;
+      addLive(live, `thread started: ${event.thread_id}`);
+      break;
+    case "turn.started":
+      addLive(live, "turn started");
+      break;
+    case "turn.completed":
+      addLive(live, formatUsage(event.usage));
+      break;
+    case "turn.failed":
+      addLive(live, `turn failed: ${event.error?.message || "unknown error"}`);
+      break;
+    case "error":
+      addLive(live, `error: ${event.message || JSON.stringify(event)}`);
+      break;
+    case "item.started":
+      addLive(live, formatItem("started", event.item));
+      break;
+    case "item.completed":
+      if (event.item?.type === "agent_message" && event.item.text) {
+        live.final = event.item.text;
+        addLive(live, "agent message completed");
+      } else {
+        addLive(live, formatItem("completed", event.item));
+      }
+      break;
+    default:
+      if (event.type?.startsWith("item.")) addLive(live, event.type);
+  }
+
+  void flushLive(live, false);
+}
+
+function formatItem(phase, item = {}) {
+  if (item.type === "command_execution") return `${phase}: command ${item.command || ""}`.trim();
+  if (item.type === "reasoning") return `${phase}: reasoning`;
+  if (item.type === "file_change") return `${phase}: file change ${item.path || ""}`.trim();
+  if (item.type === "mcp_tool_call") return `${phase}: MCP ${item.server || ""} ${item.tool || ""}`.trim();
+  if (item.type === "web_search") return `${phase}: web search`;
+  if (item.type === "plan_update") return `${phase}: plan update`;
+  if (item.type === "agent_message") return `${phase}: agent message`;
+  return `${phase}: ${item.type || "item"}`;
+}
+
+function formatUsage(usage = {}) {
+  const input = usage.input_tokens ?? "?";
+  const output = usage.output_tokens ?? "?";
+  return `turn completed: input ${input}, output ${output}`;
+}
+
+function addLive(live, line) {
+  const value = clean(line);
+  if (!value) return;
+  live.lines.push(`${new Date().toLocaleTimeString("en-GB")} ${value}`);
+  live.lines = live.lines.slice(-18);
+}
+
+async function flushLive(live, force) {
+  const now = Date.now();
+  if (!force && now - live.lastEdit < config.liveUpdateIntervalMs) return;
+  live.lastEdit = now;
+  const text = truncate(`Codex progress\n\n${live.lines.join("\n")}`, config.maxTelegramChars);
+  await editBridgeMessage(live.target, live.messageId, text, {
+    inline_keyboard: [[{ text: "Stop", callback_data: "stop" }, { text: "Status", callback_data: "status" }]],
+  }).catch(() => {});
+}
+
+async function stopRun(target) {
+  const run = running.get(target.key);
+  if (!run) {
+    await sendBridgeMessage(target, "No running Codex turn for this session.");
+    return;
+  }
+  run.child.kill("SIGTERM");
+  setTimeout(() => {
+    if (running.has(target.key)) run.child.kill("SIGKILL");
+  }, 3000).unref();
+  await sendBridgeMessage(target, "Stopping current Codex turn.");
+}
+
+function getSession(sessionKey) {
+  const key = String(sessionKey);
+  state.sessions ||= {};
+  state.sessions[key] ||= {
+    workdir: config.workspaces[0],
+    sandbox: config.defaultSandbox,
+    approvalPolicy: config.defaultApprovalPolicy,
+    model: config.defaultModel,
+  };
+  return state.sessions[key];
+}
+
+function statusText(sessionKey) {
+  const session = getSession(sessionKey);
+  const isRunning = running.has(String(sessionKey));
+  return [
+    "Codex Bridge status",
+    "",
+    `running: ${isRunning ? "yes" : "no"}`,
+    `waiting answer: ${session.pendingAnswer ? "yes" : "no"}`,
+    `workdir: ${session.workdir || config.workspaces[0]}`,
+    `workspace commands: ${formatWorkspaceCommands(config.workspaceCommands) || "none"}`,
+    `sandbox: ${session.sandbox || config.defaultSandbox}`,
+    `approval: ${session.approvalPolicy || config.defaultApprovalPolicy}`,
+    `skip git repo check: ${config.skipGitRepoCheck ? "yes" : "no"}`,
+    `model: ${session.model || config.defaultModel || "Codex default"}`,
+    `stt: ${config.sttCommand ? "enabled" : "disabled"}`,
+    `history messages: ${session.history?.length || 0}`,
+    `thread: ${session.threadId || "none"}`,
+  ].join("\n");
+}
+
+function helpText() {
+  return [
+    "Codex Bridge",
+    "",
+    `Codex runs only when a message starts with: ${config.bridgeCommands.join(", ")}`,
+    "Add --history to include recent dialog history in the Codex prompt.",
+    "Voice/audio transcripts and JSON captions use the same command parser.",
+    "",
+    "Commands:",
+    "/codex <task> - run Codex without dialog history",
+    "/codex --history <task> - run Codex with recent dialog history",
+    "/status - show session status",
+    "/new - start a fresh Codex thread",
+    "/resume - show saved thread",
+    "/stop - stop current turn",
+    "/cancel - clear pending answer mode",
+    "/repo - choose workspace",
+    "/commands - list workspace commands",
+    workspaceHelpLine(),
+    "/model [name] - show or set model",
+    "/sandbox [read-only|workspace-write|danger-full-access] - show or set sandbox",
+    "/approval [untrusted|on-request|on-failure|never] - show or set approval policy",
+    "/diff - summarize git diff",
+    "/help - show this help",
+  ].join("\n");
+}
+
+function statusKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Read only", callback_data: "sandbox:read-only" }, { text: "Workspace write", callback_data: "sandbox:workspace-write" }],
+      [{ text: "Danger full access", callback_data: "sandbox:danger-full-access" }],
+      [{ text: "Ask on request", callback_data: "approval:on-request" }, { text: "Ask untrusted", callback_data: "approval:untrusted" }],
+      [{ text: "Choose workspace", callback_data: "repo:0" }, { text: "Stop", callback_data: "stop" }],
+    ],
+  };
+}
+
+function sandboxKeyboard() {
+  return {
+    inline_keyboard: [[
+      { text: "Read only", callback_data: "sandbox:read-only" },
+      { text: "Workspace write", callback_data: "sandbox:workspace-write" },
+      { text: "Danger full access", callback_data: "sandbox:danger-full-access" },
+    ]],
+  };
+}
+
+function approvalKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "On request", callback_data: "approval:on-request" }, { text: "Untrusted", callback_data: "approval:untrusted" }],
+      [{ text: "On failure", callback_data: "approval:on-failure" }, { text: "Never", callback_data: "approval:never" }],
+    ],
+  };
+}
+
+function repoKeyboard() {
+  return {
+    inline_keyboard: config.workspaces.map((workspace, index) => ([{
+      text: `${index + 1}. ${workspace}`,
+      callback_data: `repo:${index}`,
+    }])),
+  };
+}
+
+function answerKeyboard() {
+  return {
+    inline_keyboard: [[
+      { text: "Answer with text", callback_data: "answer:custom" },
+      { text: "Let Codex decide", callback_data: "answer:assume" },
+    ]],
+  };
+}
+
+function mediaKeyboard(mediaId) {
+  return {
+    inline_keyboard: [[
+      { text: "Info", callback_data: `media:info:${mediaId}` },
+      { text: "Delete", callback_data: `media:delete:${mediaId}` },
+    ]],
+  };
+}
+
+function switchSessionWorkspace(session, workdir) {
+  session.workdir = workdir;
+  delete session.threadId;
+  delete session.pendingAnswer;
+  delete session.history;
+  delete session.seenInbound;
+}
+
+function parseWorkspaceCommand(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed || config.workspaceCommands.size === 0) return null;
+
+  const match = trimmed.match(/^\/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s+|$)([\s\S]*)/);
+  if (!match) return null;
+
+  const alias = match[1].toLowerCase();
+  const workdir = config.workspaceCommands.get(alias);
+  if (!workdir) return null;
+
+  return {
+    alias,
+    workdir,
+    prompt: (match[2] || "").trim(),
+  };
+}
+
+function parseWorkspaceCommandSpec(spec, workspaces) {
+  const commands = new Map();
+  for (const workspace of workspaces) {
+    addWorkspaceAlias(commands, path.basename(workspace), workspace);
+  }
+  if (workspaces.includes("/home/agent")) addWorkspaceAlias(commands, "agent", "/home/agent");
+
+  for (const item of csv(spec)) {
+    const match = item.match(/^\/?([A-Za-z0-9_]+)=(.+)$/);
+    if (!match) throw new Error(`Invalid WORKSPACE_COMMANDS entry: ${item}`);
+    const alias = match[1].toLowerCase();
+    const workdir = path.resolve(match[2].trim());
+    if (!workspaces.includes(workdir)) {
+      throw new Error(`WORKSPACE_COMMANDS path must be present in WORKSPACE_ALLOWLIST: ${workdir}`);
+    }
+    addWorkspaceAlias(commands, alias, workdir);
+  }
+  return commands;
+}
+
+function addWorkspaceAlias(commands, alias, workdir) {
+  const normalized = String(alias || "").trim().toLowerCase();
+  if (!normalized || !/^[a-z0-9_]+$/.test(normalized)) return;
+  commands.set(normalized, workdir);
+}
+
+function formatWorkspaceCommands(commands) {
+  return [...commands.entries()].map(([alias, workdir]) => `/${alias}=${workdir}`).join(", ");
+}
+
+function workspaceCommandsText() {
+  const entries = [...config.workspaceCommands.entries()];
+  if (entries.length === 0) return "No workspace commands configured.";
+  return [
+    "Workspace commands",
+    "",
+    ...entries.map(([alias, workdir]) => `/${alias} - ${workdir}`),
+  ].join("\n");
+}
+
+function workspaceHelpLine() {
+  const commands = formatWorkspaceCommands(config.workspaceCommands);
+  if (!commands) return "/<workspace> [task] - switch workspace mode";
+  return `/<workspace> [task] - switch workspace mode (${commands})`;
+}
+
+async function sendMessage(chatId, text, extra = {}) {
+  return telegram("sendMessage", {
+    chat_id: chatId,
+    text: truncate(text, config.maxTelegramChars),
+    ...extra,
+  });
+}
+
+async function sendLong(chatId, text) {
+  const chunks = chunkText(text, config.maxTelegramChars);
+  for (const chunk of chunks) await sendMessage(chatId, chunk);
+}
+
+async function editMessage(message, text, replyMarkup) {
+  return telegram("editMessageText", {
+    chat_id: message.chat.id,
+    message_id: message.message_id,
+    text: truncate(text, config.maxTelegramChars),
+    reply_markup: replyMarkup,
+  });
+}
+
+async function editMediaCallbackMessage(message, text, replyMarkup) {
+  try {
+    return await telegram("editMessageCaption", {
+      chat_id: message.chat.id,
+      message_id: message.message_id,
+      caption: truncate(text, 1000),
+      reply_markup: replyMarkup,
+    });
+  } catch (error) {
+    return editMessage(message, text, replyMarkup);
+  }
+}
+
+async function sendInboxMediaMessage(chatId, record) {
+  if (!record?.file?.path) return null;
+  return sendTelegramDocument(chatId, record.file.path, record.file.mimeType || "application/octet-stream", formatInboxMediaCaption(record), mediaKeyboard(record.mediaId));
+}
+
+async function sendTelegramDocument(chatId, filePath, mimeType, caption, replyMarkup) {
+  const form = new FormData();
+  const fileName = path.basename(filePath);
+  form.append("chat_id", String(chatId));
+  form.append("document", new Blob([readFileSync(filePath)], { type: mimeType }), fileName);
+  form.append("caption", truncate(caption, 1000));
+  if (replyMarkup) form.append("reply_markup", JSON.stringify(replyMarkup));
+  return telegramMultipart("sendDocument", form);
+}
+
+async function answerCallback(callbackQueryId, text) {
+  return telegram("answerCallbackQuery", {
+    callback_query_id: callbackQueryId,
+    text,
+  });
+}
+
+function telegramTarget(chatId) {
+  return { adapter: "telegram", key: "telegram", chatId };
+}
+
+function collabmdTarget(sessionId) {
+  return { adapter: "collabmd", key: `collabmd:${sessionId}`, sessionId };
+}
+
+async function sendBridgeMessage(target, text, extra = {}) {
+  if (target.adapter === "telegram") return sendMessage(target.chatId, text, extra);
+  return pushCollabmdOutbox(target.sessionId, "message", { text: truncate(text, config.maxTelegramChars), extra });
+}
+
+async function sendBridgeLong(target, text) {
+  if (target.adapter === "telegram") return sendLong(target.chatId, text);
+  const chunks = chunkText(text, config.maxTelegramChars);
+  for (const chunk of chunks) await sendBridgeMessage(target, chunk);
+}
+
+async function editBridgeMessage(target, messageId, text, replyMarkup) {
+  if (target.adapter === "telegram") {
+    return telegram("editMessageText", {
+      chat_id: target.chatId,
+      message_id: messageId,
+      text: truncate(text, config.maxTelegramChars),
+      reply_markup: replyMarkup,
+    });
+  }
+  return pushCollabmdOutbox(target.sessionId, "edit", {
+    message_id: messageId,
+    text: truncate(text, config.maxTelegramChars),
+    reply_markup: replyMarkup,
+  });
+}
+
+async function telegram(method, payload) {
+  const res = await fetch(`${apiBase}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok || !body?.ok) {
+    throw new Error(`Telegram ${method} failed: ${res.status} ${JSON.stringify(body)}`);
+  }
+  return body.result;
+}
+
+async function telegramMultipart(method, form) {
+  const res = await fetch(`${apiBase}/${method}`, {
+    method: "POST",
+    body: form,
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok || !body?.ok) {
+    throw new Error(`Telegram ${method} failed: ${res.status} ${JSON.stringify(body)}`);
+  }
+  return body.result;
+}
+
+async function handleBridgeTextMessage(target, payload) {
+  const text = String(payload.text || "").trim();
+  if (!text) return { accepted: false, reason: "empty_message" };
+
+  const session = getSession(target.key);
+  const messageId = normalizeInboundMessageId(payload.messageId || payload.id || payload.clientMessageId);
+  if (markInboundMessageSeen(session, target, messageId)) {
+    saveState();
+    return { accepted: false, reason: "duplicate_message" };
+  }
+
+  appendHistory(session, {
+    role: payload.role || "user",
+    text,
+    adapter: target.adapter,
+    userId: String(payload.userId || ""),
+    author: payload.author || "",
+    messageId,
+    at: payload.at || new Date().toISOString(),
+  });
+  saveState();
+
+  if (session.pendingAnswer) {
+    delete session.pendingAnswer;
+    saveState();
+    await runCodex(target, `User answer to your previous question:\n\n${text}`);
+    return { accepted: true, reason: "pending_answer" };
+  }
+
+  const bridgeCommand = parseBridgeCommand(text);
+  if (!bridgeCommand) return { accepted: false, reason: "no_bridge_command" };
+  if (!bridgeCommand.prompt) {
+    await sendBridgeMessage(target, `Usage: ${config.bridgeCommands[0]} <task>`);
+    return { accepted: false, reason: "empty_bridge_command" };
+  }
+
+  await runCodex(target, buildPrompt(session, bridgeCommand, text));
+  return { accepted: true, reason: "bridge_command" };
+}
+
+function parseBridgeCommand(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return null;
+
+  for (const rawPrefix of config.bridgeCommands) {
+    const prefix = rawPrefix.trim();
+    if (!prefix) continue;
+
+    let rest = null;
+    if (prefix.endsWith(":")) {
+      if (trimmed.toLowerCase().startsWith(prefix.toLowerCase())) rest = trimmed.slice(prefix.length).trim();
+    } else if (prefix.startsWith("/")) {
+      const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const match = trimmed.match(new RegExp(`^${escaped}(?:@[A-Za-z0-9_]+)?(?:\\s+|$)([\\s\\S]*)`, "i"));
+      if (match) rest = (match[1] || "").trim();
+    } else if (trimmed.toLowerCase().startsWith(prefix.toLowerCase())) {
+      const next = trimmed.slice(prefix.length, prefix.length + 1);
+      if (!next || /\s/.test(next)) rest = trimmed.slice(prefix.length).trim();
+    }
+
+    if (rest !== null) return parseBridgeArgs(rest);
+  }
+
+  return null;
+}
+
+function parseBridgeArgs(input) {
+  const tokens = input.split(/\s+/).filter(Boolean);
+  let includeHistory = config.includeHistoryByDefault;
+  const promptTokens = [];
+  for (const token of tokens) {
+    if (token === "--history" || token === "--with-history" || token === "-H") {
+      includeHistory = true;
+      continue;
+    }
+    if (token === "--no-history") {
+      includeHistory = false;
+      continue;
+    }
+    promptTokens.push(token);
+  }
+  return { prompt: promptTokens.join(" ").trim(), includeHistory };
+}
+
+function buildPrompt(session, bridgeCommand, originalText, replyInboxContext = null) {
+  const prompt = bridgeCommand.prompt || stripBridgePrefix(originalText);
+  const replyMedia = formatReplyInboxPromptSection(replyInboxContext);
+  if (!bridgeCommand.includeHistory) {
+    return [replyMedia, replyMedia ? "Task:" : "", prompt].filter(Boolean).join("\n\n");
+  }
+
+  const history = (session.history || [])
+    .slice(-config.maxHistoryMessages)
+    .map(item => `${item.role || "user"}${item.author ? ` (${item.author})` : ""}: ${item.text}`)
+    .join("\n");
+
+  return [
+    "Recent dialog history follows. Use it only as context for the requested task.",
+    "",
+    history,
+    "",
+    replyMedia,
+    "",
+    "Task:",
+    prompt,
+  ].join("\n");
+}
+
+function buildTextPrompt(text, replyInboxContext = null) {
+  const replyMedia = formatReplyInboxPromptSection(replyInboxContext);
+  return [replyMedia, replyMedia ? "Task:" : "", text].filter(Boolean).join("\n\n");
+}
+
+function formatReplyInboxPromptSection(replyInboxContext = null) {
+  if (!replyInboxContext) return "";
+  return [
+    "Telegram reply media:",
+    formatSavedInboxMessage(replyInboxContext.record, replyInboxContext.path),
+  ].join("\n");
+}
+
+function stripBridgePrefix(text) {
+  const parsed = parseBridgeCommand(text);
+  return parsed?.prompt || String(text || "").trim();
+}
+
+function appendHistory(session, item) {
+  session.history ||= [];
+  session.history.push({
+    role: item.role || "user",
+    text: String(item.text || "").slice(0, 12000),
+    adapter: item.adapter || "",
+    userId: item.userId || "",
+    author: item.author || "",
+    media: item.media || "",
+    attachmentPath: item.attachmentPath || "",
+    mediaId: item.mediaId || "",
+    messageId: item.messageId || "",
+    at: item.at || new Date().toISOString(),
+  });
+  session.history = session.history.slice(-Math.max(config.maxHistoryMessages * 3, 50));
+}
+
+function normalizeInboundMessageId(value) {
+  const id = String(value ?? "").trim();
+  return id.slice(0, 300);
+}
+
+function markInboundMessageSeen(session, target, messageId) {
+  if (!messageId) return false;
+  session.seenInbound ||= [];
+  const key = `${target.adapter}:${messageId}`;
+  if (session.seenInbound.includes(key)) return true;
+  session.seenInbound.push(key);
+  session.seenInbound = session.seenInbound.slice(-Math.max(config.maxHistoryMessages * 6, 200));
+  return false;
+}
+
+function startCollabmdHttpAdapter() {
+  const server = http.createServer((req, res) => {
+    void handleCollabmdHttpRequest(req, res).catch(error => {
+      console.error("collabmd adapter error", error);
+      sendJson(res, 500, { ok: false, error: error.message });
+    });
+  });
+
+  server.listen(config.collabmdPort, config.collabmdHost, () => {
+    console.log(`CollabMD adapter listening on http://${config.collabmdHost}:${config.collabmdPort}`);
+  });
+}
+
+async function handleCollabmdHttpRequest(req, res) {
+  const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+  if (url.pathname === "/health") {
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (!isCollabmdAuthorized(req)) {
+    sendJson(res, 401, { ok: false, error: "unauthorized" });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/messages") {
+    const body = await readJsonBody(req);
+    const sessionId = String(body.sessionId || body.conversationId || "").trim();
+    if (!sessionId) {
+      sendJson(res, 400, { ok: false, error: "sessionId is required" });
+      return;
+    }
+    const result = await handleBridgeTextMessage(collabmdTarget(sessionId), body);
+    sendJson(res, result.accepted ? 202 : 200, { ok: true, ...result });
+    return;
+  }
+
+  const outboxMatch = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/outbox$/);
+  if (req.method === "GET" && outboxMatch) {
+    const sessionId = decodeURIComponent(outboxMatch[1]);
+    const after = Number(url.searchParams.get("after") || 0);
+    const messages = getCollabmdOutbox(sessionId).filter(message => message.id > after);
+    sendJson(res, 200, { ok: true, messages });
+    return;
+  }
+
+  sendJson(res, 404, { ok: false, error: "not_found" });
+}
+
+function isCollabmdAuthorized(req) {
+  if (!config.collabmdToken) return true;
+  const expected = `Bearer ${config.collabmdToken}`;
+  return req.headers.authorization === expected || req.headers["x-bridge-token"] === config.collabmdToken;
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", chunk => {
+      body += chunk;
+      if (body.length > config.maxHttpBodyBytes) {
+        reject(new Error("request body too large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch {
+        reject(new Error("invalid JSON body"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function pushCollabmdOutbox(sessionId, type, payload) {
+  state.collabmdOutbox ||= {};
+  const key = String(sessionId);
+  const outbox = state.collabmdOutbox[key] ||= [];
+  const message = {
+    id: Number(state.nextOutboxId || 1),
+    type,
+    at: new Date().toISOString(),
+    ...payload,
+  };
+  state.nextOutboxId = message.id + 1;
+  outbox.push(message);
+  state.collabmdOutbox[key] = outbox.slice(-200);
+  saveState();
+  return { message_id: message.id };
+}
+
+function getCollabmdOutbox(sessionId) {
+  state.collabmdOutbox ||= {};
+  return state.collabmdOutbox[String(sessionId)] || [];
+}
+
+function sendJson(res, statusCode, body) {
+  const data = JSON.stringify(body);
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(data),
+  });
+  res.end(data);
+}
+
+async function handleAudioMessage(target, session, audio, inboxPath = "", inboxRecord = null) {
+  if (running.has(target.key)) {
+    await sendBridgeMessage(target, "A Codex turn is already running for this session. Use /stop to cancel it.");
+    return;
+  }
+  if (!config.sttCommand) {
+    if (inboxPath) {
+      appendHistory(session, {
+        role: "user",
+        text: `Uploaded audio: ${inboxPath}`,
+        adapter: target.adapter,
+        media: "audio",
+        attachmentPath: inboxPath,
+        mediaId: inboxRecord?.mediaId || "",
+        at: new Date().toISOString(),
+      });
+      saveState();
+    }
+    const savedLine = inboxPath ? `${formatSavedInboxMessage(inboxRecord, inboxPath)}\n\n` : "";
+    await sendBridgeMessage(target, `${savedLine}STT is not configured. Set STT_COMMAND in .env and restart the bridge.`);
+    return;
+  }
+  if (audio.fileSize && audio.fileSize > config.maxAudioBytes) {
+    if (inboxPath) {
+      appendHistory(session, {
+        role: "user",
+        text: `Uploaded audio: ${inboxPath}`,
+        adapter: target.adapter,
+        media: "audio",
+        attachmentPath: inboxPath,
+        mediaId: inboxRecord?.mediaId || "",
+        at: new Date().toISOString(),
+      });
+      saveState();
+    }
+    const savedLine = inboxPath ? `${formatSavedInboxMessage(inboxRecord, inboxPath)}\n\n` : "";
+    await sendBridgeMessage(target, `${savedLine}Audio is too large for STT: ${audio.fileSize} bytes. Limit: ${config.maxAudioBytes} bytes.`);
+    return;
+  }
+
+  const progress = await sendBridgeMessage(target, "Transcribing audio...");
+  let tempDir = "";
+  try {
+    tempDir = mkdtempSync(path.join(tmpdir(), "codex-telegram-audio-"));
+    const sourcePath = await downloadTelegramFile(audio.fileId, tempDir, audio.fileName, {
+      maxBytes: config.maxAudioBytes,
+      label: "audio",
+    });
+    const wavPath = path.join(tempDir, "audio.wav");
+    await runProcess("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-i", sourcePath, "-ar", "16000", "-ac", "1", wavPath], {
+      cwd: ROOT,
+      timeoutMs: config.sttTimeoutMs,
+    });
+    const transcript = (await runSttCommand(wavPath)).trim();
+    if (!transcript) {
+      await editBridgeMessage(target, progress.message_id, "STT returned an empty transcript.", undefined);
+      return;
+    }
+
+    appendHistory(session, {
+      role: "user",
+      text: transcript,
+      adapter: target.adapter,
+      media: "audio",
+      attachmentPath: inboxPath,
+      mediaId: inboxRecord?.mediaId || "",
+      at: new Date().toISOString(),
+    });
+    saveState();
+
+    await editBridgeMessage(target, progress.message_id, truncate(`Transcribed:\n\n${transcript}`, config.maxTelegramChars), undefined);
+    if (session.pendingAnswer) {
+      delete session.pendingAnswer;
+      saveState();
+      await runCodex(target, `User answer to your previous question, transcribed from an audio message:\n\n${transcript}`);
+      return;
+    }
+    const bridgeCommand = parseBridgeCommand(transcript);
+    if (bridgeCommand) await runCodex(target, buildPrompt(session, bridgeCommand, transcript));
+    else await sendBridgeMessage(target, `Transcript saved to dialog history. Start with ${config.bridgeCommands[0]} to send a task to Codex.`);
+  } catch (error) {
+    await editBridgeMessage(target, progress.message_id, `Audio transcription failed: ${error.message}`, undefined).catch(() => {});
+  } finally {
+    if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function handleJsonDocumentMessage(target, session, document, caption, inboxPath = "", inboxRecord = null) {
+  if (running.has(target.key)) {
+    await sendBridgeMessage(target, "A Codex turn is already running for this session. Use /stop to cancel it.");
+    return;
+  }
+  if (document.fileSize && document.fileSize > config.maxJsonBytes) {
+    await sendBridgeMessage(target, `JSON file is too large: ${document.fileSize} bytes. Limit: ${config.maxJsonBytes} bytes.`);
+    return;
+  }
+
+  const progress = await sendBridgeMessage(target, "Downloading JSON file...");
+  try {
+    mkdirSync(config.jsonUploadDir, { recursive: true, mode: 0o700 });
+    const uploadPath = await downloadTelegramFile(document.fileId, config.jsonUploadDir, document.fileName, {
+      maxBytes: config.maxJsonBytes,
+      label: "JSON file",
+    });
+    const prompt = [
+      "User uploaded JSON file:",
+      uploadPath,
+      inboxPath ? formatSavedInboxMessage(inboxRecord, inboxPath) : "",
+      caption.trim() ? `Caption:\n${caption.trim()}` : "",
+    ].filter(Boolean).join("\n");
+
+    appendHistory(session, {
+      role: "user",
+      text: caption.trim() || `Uploaded JSON file: ${uploadPath}`,
+      adapter: target.adapter,
+      media: "json",
+      attachmentPath: inboxPath,
+      mediaId: inboxRecord?.mediaId || "",
+      at: new Date().toISOString(),
+    });
+    saveState();
+
+    await editBridgeMessage(target, progress.message_id, prompt, undefined);
+    if (session.pendingAnswer) {
+      delete session.pendingAnswer;
+      saveState();
+      await runCodex(target, prompt);
+      return;
+    }
+    const bridgeCommand = parseBridgeCommand(caption || "");
+    if (bridgeCommand) await runCodex(target, buildPrompt(session, bridgeCommand, prompt));
+    else await sendBridgeMessage(target, `JSON saved at:\n${uploadPath}${inboxPath ? `\n\n${formatSavedInboxMessage(inboxRecord, inboxPath)}` : ""}\n\nAdd a ${config.bridgeCommands[0]} caption to send it to Codex.`);
+  } catch (error) {
+    await editBridgeMessage(target, progress.message_id, `JSON file download failed: ${error.message}`, undefined).catch(() => {});
+  }
+}
+
+function getInboxAttachment(message) {
+  const photo = getPhotoAttachment(message);
+  if (photo) return photo;
+
+  if (message.voice?.file_id) {
+    return {
+      fileId: message.voice.file_id,
+      fileUniqueId: message.voice.file_unique_id || "",
+      fileSize: message.voice.file_size || 0,
+      fileName: `voice-${message.message_id || Date.now()}.ogg`,
+      originalFileName: `voice-${message.message_id || Date.now()}.ogg`,
+      mimeType: message.voice.mime_type || "audio/ogg",
+      mediaType: "audio",
+    };
+  }
+
+  if (message.audio?.file_id) {
+    return {
+      fileId: message.audio.file_id,
+      fileUniqueId: message.audio.file_unique_id || "",
+      fileSize: message.audio.file_size || 0,
+      fileName: message.audio.file_name || `audio-${message.message_id || Date.now()}`,
+      originalFileName: message.audio.file_name || "",
+      mimeType: message.audio.mime_type || "",
+      mediaType: "audio",
+    };
+  }
+
+  if (message.video?.file_id) {
+    return {
+      fileId: message.video.file_id,
+      fileUniqueId: message.video.file_unique_id || "",
+      fileSize: message.video.file_size || 0,
+      fileName: message.video.file_name || `video-${message.message_id || Date.now()}.mp4`,
+      originalFileName: message.video.file_name || "",
+      mimeType: message.video.mime_type || "video/mp4",
+      mediaType: "video",
+    };
+  }
+
+  if (message.animation?.file_id) {
+    return {
+      fileId: message.animation.file_id,
+      fileUniqueId: message.animation.file_unique_id || "",
+      fileSize: message.animation.file_size || 0,
+      fileName: message.animation.file_name || `animation-${message.message_id || Date.now()}.mp4`,
+      originalFileName: message.animation.file_name || "",
+      mimeType: message.animation.mime_type || "video/mp4",
+      mediaType: "video",
+    };
+  }
+
+  if (message.video_note?.file_id) {
+    return {
+      fileId: message.video_note.file_id,
+      fileUniqueId: message.video_note.file_unique_id || "",
+      fileSize: message.video_note.file_size || 0,
+      fileName: `video-note-${message.message_id || Date.now()}.mp4`,
+      originalFileName: `video-note-${message.message_id || Date.now()}.mp4`,
+      mimeType: "video/mp4",
+      mediaType: "video",
+    };
+  }
+
+  if (message.document?.file_id) {
+    const document = message.document;
+    return {
+      fileId: document.file_id,
+      fileUniqueId: document.file_unique_id || "",
+      fileSize: document.file_size || 0,
+      fileName: document.file_name || `document-${message.message_id || Date.now()}`,
+      originalFileName: document.file_name || "",
+      mimeType: document.mime_type || "",
+      mediaType: "document",
+    };
+  }
+
+  return null;
+}
+
+function getPhotoAttachment(message) {
+  const photos = message.photo || [];
+  if (!photos.length) return null;
+  const largest = photos.reduce((best, item) => {
+    const bestSize = Number(best.file_size || 0);
+    const itemSize = Number(item.file_size || 0);
+    if (itemSize !== bestSize) return itemSize > bestSize ? item : best;
+    return Number(item.width || 0) * Number(item.height || 0) > Number(best.width || 0) * Number(best.height || 0) ? item : best;
+  }, photos[0]);
+
+  return {
+    fileId: largest.file_id,
+    fileUniqueId: largest.file_unique_id || "",
+    fileSize: largest.file_size || 0,
+    fileName: `photo-${message.message_id || Date.now()}.jpg`,
+    originalFileName: `photo-${message.message_id || Date.now()}.jpg`,
+    mimeType: "image/jpeg",
+    mediaType: "image",
+  };
+}
+
+async function saveInboxAttachment(session, attachment) {
+  if (attachment.fileSize && attachment.fileSize > config.maxInboxFileBytes) {
+    throw new Error(`${attachment.mediaType} is too large: ${attachment.fileSize} bytes. Limit: ${config.maxInboxFileBytes} bytes.`);
+  }
+
+  const workdir = session.workdir || config.workspaces[0];
+  const inboxDir = path.join(workdir, "Inbox");
+  mkdirSync(inboxDir, { recursive: true, mode: 0o700 });
+  return downloadTelegramFile(attachment.fileId, inboxDir, attachment.fileName, {
+    maxBytes: config.maxInboxFileBytes,
+    label: attachment.mediaType,
+    unique: true,
+  });
+}
+
+function recordInboxMedia(session, message, attachment, inboxPath) {
+  const workspace = session.workdir || config.workspaces[0];
+  const record = createTelegramMediaRecord({
+    workspace,
+    message,
+    attachment,
+    filePath: inboxPath,
+  });
+  return upsertMediaRecord(workspace, record).item;
+}
+
+function recordInboxEchoMessage(session, record, echoMessage) {
+  const messageId = echoMessage?.message_id;
+  const chatId = echoMessage?.chat?.id || record?.telegram?.chatId || "";
+  if (!record?.mediaId || !messageId) return;
+
+  const workspace = session.workdir || config.workspaces[0];
+  addTelegramMessageAlias(workspace, record.mediaId, chatId, messageId);
+}
+
+async function getReplyInboxContext(session, message) {
+  const reply = message.reply_to_message;
+  if (!reply) return null;
+
+  const replyMessage = {
+    ...reply,
+    chat: reply.chat || message.chat,
+  };
+  const workspace = session.workdir || config.workspaces[0];
+  const found = findReplyMediaRecord(workspace, replyMessage)
+    || findReplyMediaRecordInOtherWorkspaces(workspace, replyMessage);
+  if (!found) {
+    if (!getInboxAttachment(replyMessage) && !parseMediaId(replyMessage.caption || replyMessage.text || "")) return null;
+    throw new Error("запись для этого Telegram-сообщения отсутствует");
+  }
+
+  const inboxPath = mediaRecordFilePath(found.workspace, found.item);
+  if (!inboxPath || !existsSync(inboxPath)) {
+    throw new Error(found.item.file?.relativePath || found.item.file?.path || "локальный файл отсутствует");
+  }
+
+  return { record: found.item, path: inboxPath };
+}
+
+function findReplyMediaRecordInOtherWorkspaces(currentWorkspace, message) {
+  const current = path.resolve(currentWorkspace);
+  for (const workspace of config.workspaces) {
+    if (path.resolve(workspace) === current) continue;
+    const found = findReplyMediaRecord(workspace, message);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findReplyMediaRecord(workspace, message) {
+  const item = peekMediaByTelegramMessage(workspace, message.chat.id, message.message_id)
+    || getReplyMediaByCaption(workspace, message);
+  return item ? { workspace, item } : null;
+}
+
+function getReplyMediaByCaption(workspace, message) {
+  const mediaId = parseMediaId(message.caption || message.text || "");
+  if (!mediaId) return null;
+  try {
+    return getMediaItem(workspace, mediaId, { sync: false });
+  } catch {
+    return null;
+  }
+}
+
+function parseMediaId(text) {
+  const match = String(text || "").match(/\bmediaId:\s*((?:tg|local)_[A-Za-z0-9_-]+)/);
+  return match ? match[1] : "";
+}
+
+function mediaRecordFilePath(workspace, item) {
+  if (item?.file?.relativePath) return path.resolve(workspace, item.file.relativePath);
+  if (item?.file?.path) return path.resolve(item.file.path);
+  return "";
+}
+
+function formatSavedInboxMessage(record, inboxPath) {
+  return [
+    "Saved to Inbox:",
+    inboxPath,
+    record?.mediaId ? `mediaId: ${record.mediaId}` : "",
+    `index: ${path.join(record ? path.dirname(path.dirname(record.file.path)) : path.dirname(path.dirname(inboxPath)), MEDIA_INDEX_RELATIVE_PATH)}`,
+    record?.descriptionStatus ? `description: ${record.descriptionStatus}` : "description: pending",
+  ].filter(Boolean).join("\n");
+}
+
+function formatInboxMediaCaption(record) {
+  return [
+    "Saved to Inbox",
+    `mediaId: ${record.mediaId}`,
+    `type: ${record.file?.mediaType || "file"}`,
+    `file: ${record.file?.relativePath || record.file?.path || ""}`,
+    `description: ${record.descriptionStatus || "pending"}`,
+  ].filter(Boolean).join("\n");
+}
+
+function formatMediaInfo(workspace, item) {
+  return [
+    "Media info",
+    `mediaId: ${item.mediaId}`,
+    `workspace: ${workspace}`,
+    `type: ${item.file?.mediaType || ""}`,
+    `mime: ${item.file?.mimeType || ""}`,
+    `file: ${item.file?.path || ""}`,
+    `relative: ${item.file?.relativePath || ""}`,
+    `size: ${item.file?.sizeBytes || 0}`,
+    `sha256: ${item.file?.sha256 || ""}`,
+    `telegram chat: ${item.telegram?.chatId || ""}`,
+    `telegram message: ${item.telegram?.messageId || ""}`,
+    `telegram file: ${item.telegram?.fileId || ""}`,
+    `telegram unique: ${item.telegram?.fileUniqueId || ""}`,
+    `created: ${item.createdAt || ""}`,
+    `saved: ${item.savedAt || ""}`,
+    `description: ${item.descriptionStatus || "pending"}`,
+    item.telegram?.caption ? `caption: ${item.telegram.caption}` : "",
+    item.description ? `description text: ${item.description}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+function getAudioAttachment(message) {
+  if (message.voice?.file_id) {
+    return {
+      fileId: message.voice.file_id,
+      fileUniqueId: message.voice.file_unique_id || "",
+      fileSize: message.voice.file_size || 0,
+      fileName: "voice.ogg",
+    };
+  }
+  if (message.audio?.file_id) {
+    return {
+      fileId: message.audio.file_id,
+      fileUniqueId: message.audio.file_unique_id || "",
+      fileSize: message.audio.file_size || 0,
+      fileName: message.audio.file_name || "audio",
+    };
+  }
+  if (message.document?.file_id && isAudioDocument(message.document)) {
+    return {
+      fileId: message.document.file_id,
+      fileUniqueId: message.document.file_unique_id || "",
+      fileSize: message.document.file_size || 0,
+      fileName: message.document.file_name || "audio",
+    };
+  }
+  return null;
+}
+
+function getJsonDocumentAttachment(message) {
+  const document = message.document;
+  if (!document?.file_id || !isJsonDocument(document)) return null;
+  return {
+    fileId: document.file_id,
+    fileUniqueId: document.file_unique_id || "",
+    fileSize: document.file_size || 0,
+    fileName: jsonFileName(document.file_name),
+  };
+}
+
+function isAudioDocument(document) {
+  const mime = document.mime_type || "";
+  if (mime.startsWith("audio/")) return true;
+  return /\.(aac|aiff|flac|m4a|mp3|oga|ogg|opus|wav|webm)$/i.test(document.file_name || "");
+}
+
+function isJsonDocument(document) {
+  const mime = (document.mime_type || "").toLowerCase();
+  if (mime === "application/json" || mime === "text/json" || mime.endsWith("+json")) return true;
+  return /\.json$/i.test(document.file_name || "");
+}
+
+function jsonFileName(fileName) {
+  const name = fileName || "upload.json";
+  if (/\.json$/i.test(name)) return name;
+  return `${name}.json`;
+}
+
+async function downloadTelegramFile(fileId, targetDir, fileName, options = {}) {
+  const maxBytes = options.maxBytes || config.maxAudioBytes;
+  const label = options.label || "file";
+  const file = await telegram("getFile", { file_id: fileId });
+  if (file.file_size && file.file_size > maxBytes) {
+    throw new Error(`${label} is too large: ${file.file_size} bytes`);
+  }
+
+  const url = `https://api.telegram.org/file/bot${config.botToken}/${file.file_path}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Telegram file download failed: ${res.status}`);
+  const buffer = Buffer.from(await res.arrayBuffer());
+  if (buffer.length > maxBytes) {
+    throw new Error(`${label} is too large: ${buffer.length} bytes`);
+  }
+
+  const safeName = path.basename(fileName || file.file_path || "file").replace(/[^\w.-]/g, "_") || "file";
+  const target = options.unique ? uniqueFilePath(targetDir, safeName) : path.join(targetDir, safeName);
+  writeFileSync(target, buffer, { mode: 0o600 });
+  return target;
+}
+
+function uniqueFilePath(targetDir, fileName) {
+  const parsed = path.parse(fileName);
+  const base = parsed.name || "file";
+  const ext = parsed.ext || "";
+  let candidate = path.join(targetDir, `${base}${ext}`);
+  let index = 1;
+  while (existsSync(candidate)) {
+    candidate = path.join(targetDir, `${base}-${index}${ext}`);
+    index += 1;
+  }
+  return candidate;
+}
+
+async function runSttCommand(wavPath) {
+  const [cmd, ...args] = splitCommand(config.sttCommand);
+  if (!cmd) throw new Error("STT_COMMAND is empty");
+  const result = await runProcess(cmd, [...args, wavPath], {
+    cwd: ROOT,
+    timeoutMs: config.sttTimeoutMs,
+    env: process.env,
+  });
+  return result.stdout;
+}
+
+function runProcess(cmd, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, {
+      cwd: options.cwd || ROOT,
+      env: options.env || process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 3000).unref();
+      done(new Error(`${cmd} timed out after ${options.timeoutMs}ms`));
+    }, options.timeoutMs || 120000);
+    timeout.unref();
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", chunk => { stdout += chunk; });
+    child.stderr.on("data", chunk => { stderr += chunk; });
+    child.on("error", done);
+    child.on("close", code => {
+      if (code === 0) done(null, { stdout, stderr });
+      else done(new Error(`${cmd} failed with exit code ${code}: ${clean(stderr).slice(0, 1000)}`));
+    });
+
+    function done(error, result) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else resolve(result);
+    }
+  });
+}
+
+function splitCommand(command) {
+  const parts = [];
+  let current = "";
+  let quote = "";
+  let escaping = false;
+  for (const char of command.trim()) {
+    if (escaping) {
+      current += char;
+      escaping = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaping = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = "";
+      else current += char;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        parts.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+  if (current) parts.push(current);
+  return parts;
+}
+
+function isAllowed(userId) {
+  return Number.isInteger(userId) && config.allowedUserIds.includes(userId);
+}
+
+function childEnv() {
+  const env = {};
+  for (const key of config.envAllowlist) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  env.PATH = `${path.join(ROOT, "scripts")}:${env.PATH || process.env.PATH || ""}`;
+  env.MEDIA_INDEX_BIN = path.join(ROOT, "scripts", "media-index");
+  env.CI = "1";
+  return env;
+}
+
+function loadState() {
+  mkdirSync(STATE_DIR, { recursive: true });
+  if (!existsSync(STATE_FILE)) return { sessions: {}, offset: 0 };
+  return JSON.parse(readFileSync(STATE_FILE, "utf8"));
+}
+
+function saveState() {
+  mkdirSync(STATE_DIR, { recursive: true });
+  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
+}
+
+function loadDotEnv(file) {
+  if (!existsSync(file)) return;
+  const data = readFileSync(file, "utf8");
+  for (const rawLine of data.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) continue;
+    const [, key, rawValue] = match;
+    if (process.env[key] !== undefined) continue;
+    process.env[key] = rawValue.replace(/^["']|["']$/g, "");
+  }
+}
+
+function requireEnv(key) {
+  const value = process.env[key];
+  if (!value) throw new Error(`${key} is required`);
+  return value;
+}
+
+function csv(value = "") {
+  return value.split(",").map(x => x.trim()).filter(Boolean);
+}
+
+function parseBool(value) {
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
+function looksLikeQuestion(text) {
+  const normalized = text.trim();
+  if (normalized.endsWith("?")) return true;
+  return /\b(please confirm|which option|do you want|should i|need your|choose|уточн|подтверд|какой вариант|как поступить|выбери|нужно ли)\b/i.test(normalized);
+}
+
+function clean(value) {
+  return String(value || "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\s+/g, " ").trim();
+}
+
+function truncate(text, max) {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 20)}\n... truncated ...`;
+}
+
+function chunkText(text, max) {
+  const chunks = [];
+  let rest = text;
+  while (rest.length > max) {
+    let split = rest.lastIndexOf("\n", max);
+    if (split < max / 2) split = max;
+    chunks.push(rest.slice(0, split));
+    rest = rest.slice(split).trimStart();
+  }
+  if (rest) chunks.push(rest);
+  return chunks;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}

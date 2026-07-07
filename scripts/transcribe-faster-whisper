@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec /home/agent/.hermes/hermes-agent/venv/bin/python "$(dirname "$0")/transcribe-faster-whisper.py" "$@"

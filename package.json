@@ -1,0 +1,13 @@
+{
+  "name": "codex-telegram-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/bot.js",
+    "check": "node --check src/bot.js && node --check src/media-index.js && node --check scripts/media-index"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
