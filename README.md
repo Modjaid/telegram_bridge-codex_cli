@@ -75,7 +75,7 @@ Examples:
 /agent check bridge status
 ```
 
-Switching workspace clears the saved Codex thread, pending answer mode, and bridge history for the global Telegram session. Follow-up plain text messages continue in the selected workspace until another workspace command is used.
+Using any workspace command clears the saved Codex thread, pending answer mode, and bridge history for the global Telegram session, even when the command selects the already active workspace. Follow-up plain text messages continue in the selected workspace until another workspace command is used.
 
 ## CollabMD
 

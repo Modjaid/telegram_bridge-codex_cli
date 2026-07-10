@@ -480,24 +480,14 @@ async function handleWorkspaceCommand(target, session, workspaceCommand) {
   const currentWorkdir = session.workdir || config.workspaces[0];
   const switched = currentWorkdir !== workspaceCommand.workdir;
 
-  if (switched) {
-    const run = running.get(target.key);
-    if (run) {
-      run.replaced = true;
-      running.delete(target.key);
-      run.child.kill("SIGTERM");
-      setTimeout(() => {
-        if (!run.child.killed) run.child.kill("SIGKILL");
-      }, 3000).unref();
-    }
-    switchSessionWorkspace(session, workspaceCommand.workdir);
-    saveState();
-  }
+  cancelRunningSession(target);
+  switchSessionWorkspace(session, workspaceCommand.workdir);
+  saveState();
 
   if (!workspaceCommand.prompt) {
     await sendMessage(chatId, switched
       ? `Workspace switched to /${workspaceCommand.alias}:\n${workspaceCommand.workdir}`
-      : `Already in /${workspaceCommand.alias}:\n${workspaceCommand.workdir}`);
+      : `Workspace reset for /${workspaceCommand.alias}:\n${workspaceCommand.workdir}`);
     return;
   }
 
@@ -810,6 +800,19 @@ function switchSessionWorkspace(session, workdir) {
   delete session.seenInbound;
 }
 
+function cancelRunningSession(target) {
+  const run = running.get(target.key);
+  if (!run) return false;
+
+  run.replaced = true;
+  running.delete(target.key);
+  run.child.kill("SIGTERM");
+  setTimeout(() => {
+    if (!run.child.killed) run.child.kill("SIGKILL");
+  }, 3000).unref();
+  return true;
+}
+
 function parseWorkspaceCommand(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed || config.workspaceCommands.size === 0) return null;
@@ -875,25 +878,46 @@ function workspaceHelpLine() {
 }
 
 async function sendMessage(chatId, text, extra = {}) {
+  const messageText = truncate(text, config.maxTelegramChars);
+  const formatted = formatTelegramHtml(messageText);
+  try {
+    return await telegram("sendMessage", {
+      chat_id: chatId,
+      text: formatted,
+      parse_mode: "HTML",
+      ...extra,
+    });
+  } catch (error) {
+    if (!isTelegramParseError(error)) throw error;
+  }
   return telegram("sendMessage", {
     chat_id: chatId,
-    text: truncate(text, config.maxTelegramChars),
+    text: messageText,
     ...extra,
   });
 }
 
 async function sendLong(chatId, text) {
-  const chunks = chunkText(text, config.maxTelegramChars);
-  for (const chunk of chunks) await sendMessage(chatId, chunk);
+  const chunks = chunkTelegramHtmlText(text, config.maxTelegramChars);
+  for (const chunk of chunks) {
+    try {
+      await telegram("sendMessage", {
+        chat_id: chatId,
+        text: chunk.html,
+        parse_mode: "HTML",
+      });
+    } catch (error) {
+      if (!isTelegramParseError(error)) throw error;
+      await telegram("sendMessage", {
+        chat_id: chatId,
+        text: truncate(chunk.raw, config.maxTelegramChars),
+      });
+    }
+  }
 }
 
 async function editMessage(message, text, replyMarkup) {
-  return telegram("editMessageText", {
-    chat_id: message.chat.id,
-    message_id: message.message_id,
-    text: truncate(text, config.maxTelegramChars),
-    reply_markup: replyMarkup,
-  });
+  return editTelegramMessageText(message.chat.id, message.message_id, text, replyMarkup);
 }
 
 async function editMediaCallbackMessage(message, text, replyMarkup) {
@@ -952,16 +976,33 @@ async function sendBridgeLong(target, text) {
 
 async function editBridgeMessage(target, messageId, text, replyMarkup) {
   if (target.adapter === "telegram") {
-    return telegram("editMessageText", {
-      chat_id: target.chatId,
-      message_id: messageId,
-      text: truncate(text, config.maxTelegramChars),
-      reply_markup: replyMarkup,
-    });
+    return editTelegramMessageText(target.chatId, messageId, text, replyMarkup);
   }
   return pushCollabmdOutbox(target.sessionId, "edit", {
     message_id: messageId,
     text: truncate(text, config.maxTelegramChars),
+    reply_markup: replyMarkup,
+  });
+}
+
+async function editTelegramMessageText(chatId, messageId, text, replyMarkup) {
+  const messageText = truncate(text, config.maxTelegramChars);
+  const formatted = formatTelegramHtml(messageText);
+  try {
+    return await telegram("editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text: formatted,
+      parse_mode: "HTML",
+      reply_markup: replyMarkup,
+    });
+  } catch (error) {
+    if (!isTelegramParseError(error)) throw error;
+  }
+  return telegram("editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text: messageText,
     reply_markup: replyMarkup,
   });
 }
@@ -1873,6 +1914,86 @@ function looksLikeQuestion(text) {
 
 function clean(value) {
   return String(value || "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\s+/g, " ").trim();
+}
+
+function isTelegramParseError(error) {
+  return /can't parse entities|parse/i.test(String(error?.message || ""));
+}
+
+function escapeTelegramHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function formatTelegramHtml(text) {
+  const source = String(text || "");
+  const blocks = [];
+  let protectedText = source.replace(/```[^\n`]*\n?([\s\S]*?)```/g, (_match, code) => {
+    const token = `\u0000CODEBLOCK${blocks.length}\u0000`;
+    blocks.push(`<pre>${escapeTelegramHtml(code.replace(/\n$/, ""))}</pre>`);
+    return token;
+  });
+
+  const inline = [];
+  protectedText = protectedText.replace(/`([^`\n]+)`/g, (_match, code) => {
+    const token = `\u0000INLINECODE${inline.length}\u0000`;
+    inline.push(`<code>${escapeTelegramHtml(code)}</code>`);
+    return token;
+  });
+
+  let html = escapeTelegramHtml(protectedText);
+  html = html.replace(/\u0000CODEBLOCK(\d+)\u0000/g, (_match, index) => blocks[Number(index)] || "");
+  html = html.replace(/\u0000INLINECODE(\d+)\u0000/g, (_match, index) => inline[Number(index)] || "");
+  return html;
+}
+
+function chunkTelegramHtmlText(text, max) {
+  const chunks = [];
+  let current = "";
+  for (const line of String(text || "").split(/(\n)/)) {
+    const candidate = current + line;
+    if (candidate && formatTelegramHtml(candidate).length <= max) {
+      current = candidate;
+      continue;
+    }
+    if (current) {
+      chunks.push({ raw: current, html: formatTelegramHtml(current) });
+      current = "";
+    }
+    if (formatTelegramHtml(line).length <= max) {
+      current = line;
+      continue;
+    }
+    for (const part of splitLongTelegramHtmlText(line, max)) chunks.push(part);
+  }
+  if (current) chunks.push({ raw: current, html: formatTelegramHtml(current) });
+  return chunks;
+}
+
+function splitLongTelegramHtmlText(text, max) {
+  const chunks = [];
+  let rest = String(text || "");
+  while (rest) {
+    let low = 1;
+    let high = rest.length;
+    let best = 1;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const html = formatTelegramHtml(rest.slice(0, mid));
+      if (html.length <= max) {
+        best = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    const raw = rest.slice(0, best);
+    chunks.push({ raw, html: formatTelegramHtml(raw) });
+    rest = rest.slice(best);
+  }
+  return chunks;
 }
 
 function truncate(text, max) {
