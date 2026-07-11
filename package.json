@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/bot.js",
-    "check": "node --check src/bot.js && node --check src/media-index.js && node --check src/schedule-store.js && node --check scripts/media-index && node --check scripts/schedule-task"
+    "check": "node --check src/bot.js && node --check src/media-index.js && node --check src/schedule-store.js && node --check scripts/media-index && node --check scripts/schedule-task && node --check scripts/workspace-manager"
   },
   "engines": {
     "node": ">=22"

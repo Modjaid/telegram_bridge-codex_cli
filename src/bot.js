@@ -81,6 +81,7 @@ for (const workspace of config.workspaces) {
   if (!existsSync(workspace)) throw new Error(`Workspace does not exist: ${workspace}`);
 }
 config.workspaceCommands = parseWorkspaceCommandSpec(config.workspaceCommandSpec, config.workspaces);
+config.workspaceCreateRoot = path.resolve(process.env.WORKSPACE_CREATE_ROOT || inferWorkspaceCreateRoot(config.workspaces));
 
 const apiBase = config.botToken ? `https://api.telegram.org/bot${config.botToken}` : "";
 const state = loadState();
@@ -182,6 +183,23 @@ async function handleCallback(query) {
 
   if (data.startsWith("media:")) {
     await handleMediaCallback(query, data);
+    return;
+  }
+
+  if (data === "workspace:create") {
+    await answerCallback(query.id, "Workspace name requested");
+    const root = config.workspaceCreateRoot;
+    const prompt = [
+      "Введите имя нового workspace.",
+      "",
+      `Папка будет создана внутри:\n${root}`,
+      "",
+      "Ответьте именно на это сообщение. Если отправить имя обычным сообщением, оно уйдёт в текущую Codex-сессию.",
+      "",
+      "Разрешены латинские буквы, цифры, подчёркивание и дефис.",
+    ].join("\n");
+    const requestMessage = await sendMessage(chatId, prompt, telegramReplyExtra(query.message?.message_id));
+    rememberPendingWorkspaceCreate(chatId, requestMessage.message_id);
     return;
   }
 
@@ -341,6 +359,14 @@ async function handleMessage(message) {
   const voicePrompt = Boolean(message.voice?.file_id);
   const inboxAttachment = voicePrompt ? null : getInboxAttachment(message);
   if (!text && !audio && !jsonDocument && !inboxAttachment) return;
+
+  if (text && await handlePendingWorkspaceCreateReply(message, text)) return;
+
+  const workspaceDeleteCommand = parseWorkspaceDeleteCommand(text);
+  if (workspaceDeleteCommand) {
+    await handleWorkspaceDeleteCommand(chatId, workspaceDeleteCommand, message.message_id);
+    return;
+  }
 
   const scheduleCommand = parseScheduleCommand(text);
   if (scheduleCommand) {
@@ -530,7 +556,7 @@ async function handleCommand(target, text) {
       await sendBridgeMessage(target, "Choose workspace:", { reply_markup: repoKeyboard() });
       return;
     case "/commands":
-      await sendBridgeMessage(target, workspaceCommandsText());
+      await sendBridgeMessage(target, workspaceCommandsText(), { reply_markup: workspaceCommandsKeyboard() });
       return;
     case "/model": {
       const session = getSession(target.key);
@@ -587,7 +613,7 @@ async function handleGlobalCommandWithoutSession(chatId, text, replyToMessageId 
       await sendMessage(chatId, helpText(), replyExtra);
       return true;
     case "/commands":
-      await sendMessage(chatId, workspaceCommandsText(), replyExtra);
+      await sendMessage(chatId, workspaceCommandsText(), { ...replyExtra, reply_markup: workspaceCommandsKeyboard() });
       return true;
     case "/repo":
       await sendMessage(chatId, "Choose workspace:", { ...replyExtra, reply_markup: repoKeyboard() });
@@ -715,6 +741,93 @@ function clearPendingScheduleSession(chatId) {
   delete chat.pendingScheduleTaskId;
   delete chat.pendingScheduleExpiresAt;
   saveState();
+}
+
+function rememberPendingWorkspaceCreate(chatId, messageId) {
+  state.telegramChats ||= {};
+  const key = String(chatId);
+  state.telegramChats[key] ||= {};
+  state.telegramChats[key].pendingWorkspaceCreateMessageId = String(messageId || "");
+  state.telegramChats[key].pendingWorkspaceCreateRoot = config.workspaceCreateRoot;
+  state.telegramChats[key].pendingWorkspaceCreateExpiresAt = new Date(Date.now() + 10 * 60000).toISOString();
+  saveState();
+}
+
+function clearPendingWorkspaceCreate(chatId) {
+  const chat = state.telegramChats?.[String(chatId)];
+  if (!chat) return;
+  delete chat.pendingWorkspaceCreateMessageId;
+  delete chat.pendingWorkspaceCreateRoot;
+  delete chat.pendingWorkspaceCreateExpiresAt;
+  saveState();
+}
+
+function pendingWorkspaceCreateForReply(chatId, replyMessageId) {
+  const chat = state.telegramChats?.[String(chatId)];
+  if (!chat?.pendingWorkspaceCreateMessageId) return null;
+  if (chat.pendingWorkspaceCreateExpiresAt && Date.parse(chat.pendingWorkspaceCreateExpiresAt) < Date.now()) {
+    clearPendingWorkspaceCreate(chatId);
+    return null;
+  }
+  if (String(replyMessageId || "") !== String(chat.pendingWorkspaceCreateMessageId)) return null;
+  return {
+    messageId: chat.pendingWorkspaceCreateMessageId,
+    root: chat.pendingWorkspaceCreateRoot || config.workspaceCreateRoot,
+  };
+}
+
+async function handlePendingWorkspaceCreateReply(message, text) {
+  const chatId = message.chat.id;
+  const pending = pendingWorkspaceCreateForReply(chatId, message.reply_to_message?.message_id);
+  if (!pending) return false;
+
+  clearPendingWorkspaceCreate(chatId);
+  const name = text.trim().split(/\s+/)[0] || "";
+  try {
+    const result = await runWorkspaceManager("create", ["--name", name, "--root", pending.root]);
+    applyWorkspaceManagerResult(result);
+    const target = createTelegramWorkspaceSession(chatId, {
+      alias: result.alias,
+      workdir: result.workspace,
+      prompt: "",
+    });
+    bindTelegramMessageToSession(target, message.message_id);
+    await sendBridgeMessage(target, [
+      "Workspace created.",
+      `Command: /${result.alias}`,
+      `Path: ${result.workspace}`,
+      `Instructions: ${result.agentsPath}`,
+    ].join("\n"));
+  } catch (error) {
+    await sendMessage(chatId, `Workspace create failed: ${error.message}`, telegramReplyExtra(message.message_id));
+  }
+  return true;
+}
+
+async function handleWorkspaceDeleteCommand(chatId, workspaceDeleteCommand, replyToMessageId = "") {
+  try {
+    const result = await runWorkspaceManager("delete", ["--name", workspaceDeleteCommand.alias, "--root", config.workspaceCreateRoot]);
+    applyWorkspaceManagerResult(result);
+    const activeKey = getActiveTelegramSessionKey(chatId);
+    const activeSession = activeKey ? getSession(activeKey) : null;
+    if (activeSession && path.resolve(activeSession.workdir || "") === path.resolve(result.workspace || "")) {
+      const fallback = config.workspaces[0] || "";
+      if (fallback) {
+        activeSession.workdir = fallback;
+        activeSession.workspaceCommand = workspaceAliasForPath(fallback);
+        delete activeSession.threadId;
+        delete activeSession.pendingAnswer;
+      }
+      saveState();
+    }
+    await sendMessage(chatId, [
+      `Workspace command deleted: /${result.alias}`,
+      `Removed from allowlist: ${result.workspace}`,
+      "Folder was not removed from disk.",
+    ].join("\n"), telegramReplyExtra(replyToMessageId));
+  } catch (error) {
+    await sendMessage(chatId, `Workspace delete failed: ${error.message}`, telegramReplyExtra(replyToMessageId));
+  }
 }
 
 function formatScheduleTaskList(chatId, currentWorkspace) {
@@ -961,6 +1074,12 @@ function buildScheduledTaskPrompt(task, now) {
 function isAllowedWorkspace(workspace) {
   const resolved = path.resolve(workspace || "");
   return config.workspaces.some(allowed => path.resolve(allowed) === resolved);
+}
+
+function inferWorkspaceCreateRoot(workspaces) {
+  const first = path.resolve(workspaces[0] || ROOT);
+  if (process.env.HOME && first === path.resolve(process.env.HOME)) return first;
+  return path.dirname(first);
 }
 
 function getSystemTimeZone() {
@@ -1445,6 +1564,16 @@ function parseWorkspaceCommand(text) {
   };
 }
 
+function parseWorkspaceDeleteCommand(text) {
+  const trimmed = String(text || "").trim();
+  const match = trimmed.match(/^\/delete_([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s+|$)/);
+  if (!match) return null;
+  const alias = match[1].toLowerCase();
+  const workdir = config.workspaceCommands.get(alias);
+  if (!workdir) return null;
+  return { alias, workdir };
+}
+
 function parseWorkspaceCommandSpec(spec, workspaces) {
   const commands = new Map();
   for (const workspace of workspaces) {
@@ -1477,12 +1606,33 @@ function formatWorkspaceCommands(commands) {
 
 function workspaceCommandsText() {
   const entries = [...config.workspaceCommands.entries()];
-  if (entries.length === 0) return "No workspace commands configured.";
+  if (entries.length === 0) {
+    return [
+      "Workspace commands",
+      "",
+      "No workspace commands configured.",
+      "",
+      `Create root: ${config.workspaceCreateRoot}`,
+    ].join("\n");
+  }
   return [
     "Workspace commands",
     "",
-    ...entries.map(([alias, workdir]) => `/${alias} - ${workdir}`),
+    `Create root: ${config.workspaceCreateRoot}`,
+    "",
+    ...entries.map(([alias, workdir]) => [
+      `/${alias} - ${workdir}`,
+      `/delete_${alias}`,
+    ].join("\n")),
   ].join("\n");
+}
+
+function workspaceCommandsKeyboard() {
+  return {
+    inline_keyboard: [[
+      { text: "Create new workspace", callback_data: "workspace:create" },
+    ]],
+  };
 }
 
 function workspaceHelpLine() {
@@ -2526,6 +2676,34 @@ async function runSttCommand(wavPath) {
     env: process.env,
   });
   return result.stdout;
+}
+
+async function runWorkspaceManager(command, args = []) {
+  const result = await runProcess(path.join(ROOT, "scripts", "workspace-manager"), [command, ...args], {
+    cwd: ROOT,
+    timeoutMs: 30000,
+    env: process.env,
+  });
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    throw new Error(`workspace-manager returned invalid JSON: ${clean(result.stdout).slice(0, 500)}`);
+  }
+}
+
+function applyWorkspaceManagerResult(result) {
+  if (!result?.ok) throw new Error("workspace-manager did not report success");
+  const workspaces = Array.isArray(result.workspaces) ? result.workspaces.map(item => path.resolve(item)) : [];
+  const commandEntries = Object.entries(result.workspaceCommands || {});
+  if (!workspaces.length) throw new Error("workspace-manager returned no workspaces");
+
+  config.workspaces = workspaces;
+  config.workspaceCreateRoot = path.resolve(result.createRoot || config.workspaceCreateRoot);
+  config.workspaceCommandSpec = commandEntries.map(([alias, workspace]) => `${alias}=${path.resolve(workspace)}`).join(",");
+  config.workspaceCommands = parseWorkspaceCommandSpec(config.workspaceCommandSpec, config.workspaces);
+  process.env.WORKSPACE_ALLOWLIST = config.workspaces.join(",");
+  process.env.WORKSPACE_COMMANDS = config.workspaceCommandSpec;
+  process.env.WORKSPACE_CREATE_ROOT = config.workspaceCreateRoot;
 }
 
 function runProcess(cmd, args, options = {}) {

@@ -21,6 +21,7 @@ For CollabMD-only mode, set `TELEGRAM_ADAPTER_ENABLED=false` and `COLLABMD_ADAPT
    - `TELEGRAM_ADAPTER_ENABLED`
    - `BOT_TOKEN` and `ALLOWED_USER_IDS` when Telegram is enabled
    - `WORKSPACE_ALLOWLIST`
+   - `WORKSPACE_CREATE_ROOT` if Telegram-created workspaces should use a specific parent directory
    - `WORKSPACE_COMMANDS` if you want slash commands like `/agent` or `/notes`
    - `BRIDGE_COMMANDS`
 4. Run:
@@ -41,6 +42,7 @@ If your selected workspace is not a Git repository, set `CODEX_SKIP_GIT_REPO_CHE
 - `/stop` - stop the current Codex process for this chat
 - `/cancel` - clear pending answer mode
 - `/repo` - choose workdir from `WORKSPACE_ALLOWLIST`
+- `/commands` - list workspace commands and show workspace create/delete controls
 - `/schedule` - open a schedule-management Codex session for persistent cron tasks
 - `/<workspace> [task]` - switch global Telegram workspace mode and start a fresh Codex thread
 - `/model [model]` - show or set model override
@@ -77,6 +79,17 @@ Examples:
 ```
 
 Using any workspace command clears the saved Codex thread, pending answer mode, and bridge history for the global Telegram session, even when the command selects the already active workspace. Follow-up plain text messages continue in the selected workspace until another workspace command is used.
+
+Telegram `/commands` also shows `/delete_<workspace>` under each workspace and an inline `Create new workspace` button. Pressing the button sends a reply-only prompt for the new workspace name and shows the parent directory where the folder will be created. The user must reply to that prompt; a normal message is routed to the current Codex session.
+
+Workspace create/delete operations go through:
+
+```bash
+scripts/workspace-manager create --name <workspaceName> --root <parentPath>
+scripts/workspace-manager delete --name <workspaceName>
+```
+
+Creation updates `.env`, creates the workspace directory under `WORKSPACE_CREATE_ROOT`, adds it to `WORKSPACE_ALLOWLIST` and `WORKSPACE_COMMANDS`, and creates an `AGENTS.md` file in the new workspace. Deletion removes the workspace from bridge configuration but does not remove the folder from disk.
 
 ## Scheduled Codex Tasks
 

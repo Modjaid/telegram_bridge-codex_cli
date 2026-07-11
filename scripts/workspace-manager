@@ -1,0 +1,228 @@
+#!/usr/bin/env node
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const ENV_FILE = path.join(ROOT, ".env");
+
+try {
+  main();
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
+
+function main() {
+  const [command, ...rest] = process.argv.slice(2);
+  const args = parseArgs(rest);
+  if (!command || command === "help" || command === "--help") return help();
+
+  const env = readEnvFile(ENV_FILE);
+  const workspaces = csv(getEnv(env, "WORKSPACE_ALLOWLIST")).map(item => path.resolve(item));
+  const commands = buildWorkspaceCommands(getEnv(env, "WORKSPACE_COMMANDS"), workspaces);
+  const createRoot = path.resolve(args.root || getEnv(env, "WORKSPACE_CREATE_ROOT") || inferCreateRoot(workspaces));
+
+  if (command === "list") {
+    return print({
+      ok: true,
+      createRoot,
+      workspaces,
+      workspaceCommands: Object.fromEntries(commands),
+    });
+  }
+
+  if (command === "create") {
+    const inputName = required(args, "name");
+    const alias = normalizeWorkspaceName(inputName);
+    if (!alias) throw new Error("Workspace name must contain letters, numbers, underscore, or dash.");
+    if (commands.has(alias)) throw new Error(`Workspace command already exists: /${alias}`);
+
+    const workspace = path.resolve(createRoot, alias);
+    assertInside(createRoot, workspace);
+    if (workspaces.some(item => path.resolve(item) === workspace)) {
+      throw new Error(`Workspace is already allowed: ${workspace}`);
+    }
+
+    mkdirSync(workspace, { recursive: true, mode: 0o700 });
+    const agentsPath = path.join(workspace, "AGENTS.md");
+    if (!existsSync(agentsPath)) {
+      writeFileSync(agentsPath, defaultAgentsMd(alias), { mode: 0o600 });
+    }
+
+    workspaces.push(workspace);
+    commands.set(alias, workspace);
+    writeWorkspaceEnv(env, workspaces, commands, createRoot);
+    return print({
+      ok: true,
+      action: "created",
+      alias,
+      workspace,
+      agentsPath,
+      createRoot,
+      workspaces,
+      workspaceCommands: Object.fromEntries(commands),
+    });
+  }
+
+  if (command === "delete") {
+    const alias = normalizeWorkspaceName(required(args, "name"));
+    if (!alias) throw new Error("Workspace name must contain letters, numbers, underscore, or dash.");
+    const workspace = commands.get(alias);
+    if (!workspace) throw new Error(`Workspace command not found: /${alias}`);
+
+    for (const [commandAlias, commandWorkspace] of commands.entries()) {
+      if (path.resolve(commandWorkspace) === path.resolve(workspace)) commands.delete(commandAlias);
+    }
+    const remainingWorkspaces = workspaces.filter(item => path.resolve(item) !== path.resolve(workspace));
+    if (remainingWorkspaces.length === 0) throw new Error("Cannot delete the last allowed workspace.");
+    writeWorkspaceEnv(env, remainingWorkspaces, commands, createRoot);
+    return print({
+      ok: true,
+      action: "deleted",
+      alias,
+      workspace,
+      removedFromAllowlist: remainingWorkspaces.length !== workspaces.length,
+      folderRemoved: false,
+      createRoot,
+      workspaces: remainingWorkspaces,
+      workspaceCommands: Object.fromEntries(commands),
+    });
+  }
+
+  throw new Error(`Unknown command: ${command}`);
+}
+
+function parseArgs(argv) {
+  const args = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith("--")) throw new Error(`Unexpected argument: ${token}`);
+    const key = token.slice(2);
+    const value = argv[index + 1];
+    if (value === undefined) throw new Error(`Missing value for --${key}`);
+    args[key] = value;
+    index += 1;
+  }
+  return args;
+}
+
+function readEnvFile(file) {
+  if (!existsSync(file)) throw new Error(`Missing .env file: ${file}`);
+  return readFileSync(file, "utf8").split(/\r?\n/);
+}
+
+function getEnv(lines, key) {
+  for (const rawLine of lines) {
+    const match = rawLine.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (match?.[1] === key) return unquote(match[2]);
+  }
+  return "";
+}
+
+function writeWorkspaceEnv(lines, workspaces, commands, createRoot) {
+  const values = {
+    WORKSPACE_ALLOWLIST: unique(workspaces.map(item => path.resolve(item))).join(","),
+    WORKSPACE_COMMANDS: [...commands.entries()].map(([alias, workspace]) => `${alias}=${path.resolve(workspace)}`).join(","),
+    WORKSPACE_CREATE_ROOT: path.resolve(createRoot),
+  };
+
+  const seen = new Set();
+  const next = lines.map(line => {
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
+    const key = match?.[1] || "";
+    if (!Object.hasOwn(values, key)) return line;
+    seen.add(key);
+    return `${key}=${values[key]}`;
+  });
+  for (const [key, value] of Object.entries(values)) {
+    if (!seen.has(key)) next.push(`${key}=${value}`);
+  }
+
+  const data = `${next.join("\n").replace(/\n*$/, "")}\n`;
+  const temp = `${ENV_FILE}.${process.pid}.tmp`;
+  writeFileSync(temp, data, { mode: 0o600 });
+  renameSync(temp, ENV_FILE);
+}
+
+function buildWorkspaceCommands(spec, workspaces) {
+  const commands = new Map();
+  for (const workspace of workspaces) {
+    addWorkspaceAlias(commands, path.basename(workspace), workspace);
+  }
+  if (workspaces.includes("/home/agent")) addWorkspaceAlias(commands, "agent", "/home/agent");
+
+  for (const item of csv(spec)) {
+    const match = item.match(/^\/?([A-Za-z0-9_]+)=(.+)$/);
+    if (!match) throw new Error(`Invalid WORKSPACE_COMMANDS entry: ${item}`);
+    addWorkspaceAlias(commands, match[1], path.resolve(match[2].trim()));
+  }
+  return commands;
+}
+
+function addWorkspaceAlias(commands, alias, workspace) {
+  const normalized = String(alias || "").trim().toLowerCase();
+  if (!normalized || !/^[a-z0-9_]+$/.test(normalized)) return;
+  commands.set(normalized, path.resolve(workspace));
+}
+
+function normalizeWorkspaceName(value) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/-/g, "_");
+  return /^[a-z0-9_]+$/.test(normalized) ? normalized : "";
+}
+
+function inferCreateRoot(workspaces) {
+  if (!workspaces.length) return process.cwd();
+  const first = path.resolve(workspaces[0]);
+  if (process.env.HOME && first === path.resolve(process.env.HOME)) return first;
+  return path.dirname(first);
+}
+
+function assertInside(root, target) {
+  const relative = path.relative(root, target);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`Workspace path must be inside create root: ${root}`);
+  }
+}
+
+function defaultAgentsMd(alias) {
+  return [
+    `# AGENTS.md instructions for /${alias}`,
+    "",
+    "This workspace was created by the Codex Telegram Bridge.",
+    "",
+    "## Notes",
+    "",
+    "- Keep project-specific instructions here.",
+    "- Update this file when workspace behavior or conventions change.",
+    "",
+  ].join("\n");
+}
+
+function csv(value = "") {
+  return String(value).split(",").map(item => item.trim()).filter(Boolean);
+}
+
+function unique(items) {
+  return [...new Set(items)];
+}
+
+function unquote(value) {
+  return String(value || "").replace(/^["']|["']$/g, "");
+}
+
+function required(args, key) {
+  const value = args[key];
+  if (value === undefined || value === "") throw new Error(`--${key} is required`);
+  return value;
+}
+
+function print(value) {
+  console.log(JSON.stringify(value, null, 2));
+}
+
+function help() {
+  console.log(`Usage:
+  workspace-manager list
+  workspace-manager create --name <workspaceName> [--root <parentPath>]
+  workspace-manager delete --name <workspaceName> [--root <parentPath>]`);
+}
