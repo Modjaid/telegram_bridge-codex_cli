@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
@@ -68,9 +69,14 @@ config.workspaceCommands = parseWorkspaceCommandSpec(config.workspaceCommandSpec
 const apiBase = config.botToken ? `https://api.telegram.org/bot${config.botToken}` : "";
 const state = loadState();
 const running = new Map();
+const runningWorkspaces = new Map();
+const liveProgressMessages = new Map();
 let offset = Number(state.offset || 0);
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"];
 const APPROVAL_POLICIES = ["untrusted", "on-request", "on-failure", "never"];
+const COLLAPSED_LIVE_LOG_LINES = 3;
+const TOGGLED_COLLAPSED_LIVE_LOG_LINES = 1;
+const EXPANDED_LIVE_LOG_LINES = 20;
 
 console.log("Codex Bridge started");
 console.log(`Telegram adapter: ${config.telegramEnabled ? "enabled" : "disabled"}`);
@@ -151,7 +157,8 @@ async function handleCallback(query) {
   }
 
   const data = query.data || "";
-  const target = telegramTarget(chatId);
+  const callbackSessionKey = query.message?.message_id ? findTelegramSessionKeyByMessage(chatId, query.message.message_id) : "";
+  const target = telegramTarget(chatId, callbackSessionKey || getActiveTelegramSessionKey(chatId));
   const session = getSession(target.key);
 
   if (data.startsWith("media:")) {
@@ -168,7 +175,7 @@ async function handleCallback(query) {
     session.sandbox = sandbox;
     saveState();
     await answerCallback(query.id, `Sandbox: ${session.sandbox}`);
-    await editMessage(query.message, statusText(target.key), statusKeyboard());
+    await editBridgeMessage(target, query.message.message_id, statusText(target.key), statusKeyboard());
     return;
   }
 
@@ -181,17 +188,19 @@ async function handleCallback(query) {
     session.approvalPolicy = approvalPolicy;
     saveState();
     await answerCallback(query.id, `Approval: ${session.approvalPolicy}`);
-    await editMessage(query.message, statusText(target.key), statusKeyboard());
+    await editBridgeMessage(target, query.message.message_id, statusText(target.key), statusKeyboard());
     return;
   }
 
   if (data.startsWith("repo:")) {
     const index = Number(data.slice("repo:".length));
     if (Number.isInteger(index) && config.workspaces[index]) {
-      switchSessionWorkspace(session, config.workspaces[index]);
+      const workdir = config.workspaces[index];
+      const alias = workspaceAliasForPath(workdir);
+      const newTarget = createTelegramWorkspaceSession(chatId, { alias, workdir, prompt: "" });
       saveState();
-      await answerCallback(query.id, "Workspace selected");
-      await editMessage(query.message, statusText(target.key), statusKeyboard());
+      await answerCallback(query.id, "Workspace session started");
+      await editBridgeMessage(newTarget, query.message.message_id, `Workspace session started:\n${workdir}`, statusKeyboard());
     } else {
       await answerCallback(query.id, "Unknown workspace");
     }
@@ -204,9 +213,22 @@ async function handleCallback(query) {
     return;
   }
 
+  if (data === "logs:toggle") {
+    const live = findLiveProgress(target, query.message);
+    if (!live) {
+      await answerCallback(query.id, "No live logs");
+      return;
+    }
+    live.expanded = !live.expanded;
+    if (!live.expanded) live.collapsedLineCount = TOGGLED_COLLAPSED_LIVE_LOG_LINES;
+    await answerCallback(query.id, live.expanded ? "More logs" : "Collapsed");
+    await flushLive(live, true);
+    return;
+  }
+
   if (data === "status") {
     await answerCallback(query.id, "Status");
-    await editMessage(query.message, statusText(target.key), statusKeyboard());
+    await editBridgeMessage(target, query.message.message_id, statusText(target.key), statusKeyboard());
     return;
   }
 
@@ -214,7 +236,7 @@ async function handleCallback(query) {
     session.pendingAnswer = true;
     saveState();
     await answerCallback(query.id, "Waiting for your text answer");
-    await sendMessage(chatId, "Send your answer as the next message. I will pass it back to Codex in the same thread.");
+    await sendBridgeMessage(target, "Send your answer as the next message. I will pass it back to Codex in the same thread.");
     return;
   }
 
@@ -275,7 +297,11 @@ async function handleMediaCallback(query, data) {
 
     console.log(`unknown media action: action=${action || ""} mediaId=${mediaId}`);
     await answerCallback(query.id, "Unknown media action");
-    if (chatId) await sendMessage(chatId, `Unknown media action: ${action || ""}`);
+    if (chatId) {
+      const sessionKey = query.message?.message_id ? findTelegramSessionKeyByMessage(chatId, query.message.message_id) : "";
+      const session = sessionKey ? getSession(sessionKey) : null;
+      await sendMessage(chatId, `Unknown media action: ${action || ""}`, telegramSessionReplyExtra(session));
+    }
   } catch (error) {
     console.error(`media callback failed: action=${action || ""} mediaId=${mediaId} error=${error.stack || error.message}`);
     await answerCallback(query.id, `Media action failed: ${error.message}`).catch(() => {});
@@ -284,10 +310,9 @@ async function handleMediaCallback(query, data) {
 
 async function handleMessage(message) {
   const chatId = message.chat.id;
-  const target = telegramTarget(chatId);
   const userId = message.from?.id;
   if (!isAllowed(userId)) {
-    await sendMessage(chatId, "Access denied.");
+    await sendMessage(chatId, "Access denied.", telegramReplyExtra(message.message_id));
     return;
   }
 
@@ -297,7 +322,39 @@ async function handleMessage(message) {
   const inboxAttachment = getInboxAttachment(message);
   if (!text && !audio && !jsonDocument && !inboxAttachment) return;
 
-  const session = getSession(target.key);
+  const workspaceCommand = parseWorkspaceCommand(text);
+  let target = null;
+  let session = null;
+  if (workspaceCommand) {
+    target = createTelegramWorkspaceSession(chatId, workspaceCommand);
+    session = getSession(target.key);
+    bindTelegramMessageToSession(target, message.message_id);
+  } else {
+    const replySessionKey = message.reply_to_message?.message_id
+      ? findTelegramSessionKeyByMessage(chatId, message.reply_to_message.message_id)
+      : "";
+    const activeSessionKey = replySessionKey || getActiveTelegramSessionKey(chatId);
+    if (activeSessionKey) {
+      target = telegramTarget(chatId, activeSessionKey);
+      session = getSession(target.key);
+      setActiveTelegramSessionKey(chatId, target.key);
+      bindTelegramMessageToSession(target, message.message_id);
+      saveState();
+    }
+  }
+
+  if (!target || !session) {
+    if (await handleGlobalCommandWithoutSession(chatId, text, message.message_id)) return;
+    await sendMessage(
+      chatId,
+      `No active workspace session. Start one with a workspace command, for example:\n${firstWorkspaceCommandExample()}`,
+      telegramReplyExtra(message.message_id),
+    );
+    return;
+  }
+
+  rememberTelegramUserMessage(target, message);
+
   let inboxPath = "";
   let inboxRecord = null;
   let inboxEchoSent = false;
@@ -305,16 +362,18 @@ async function handleMessage(message) {
     try {
       inboxPath = await saveInboxAttachment(session, inboxAttachment);
       inboxRecord = recordInboxMedia(session, message, inboxAttachment, inboxPath);
+      bindTelegramMessageToSession(target, message.message_id);
     } catch (error) {
-      await sendMessage(chatId, `Failed to save media to Inbox: ${error.message}`);
+      await sendBridgeMessage(target, `Failed to save media to Inbox: ${error.message}`);
       return;
     }
     try {
-      const echoMessage = await sendInboxMediaMessage(chatId, inboxRecord);
+      const echoMessage = await sendInboxMediaMessage(target, inboxRecord);
       recordInboxEchoMessage(session, inboxRecord, echoMessage);
+      bindTelegramMessageToSession(target, echoMessage?.message_id);
       inboxEchoSent = true;
     } catch (error) {
-      await sendMessage(chatId, `Saved to Inbox, but failed to send media controls: ${error.message}\n\n${formatSavedInboxMessage(inboxRecord, inboxPath)}`);
+      await sendBridgeMessage(target, `Saved to Inbox, but failed to send media controls: ${error.message}\n\n${formatSavedInboxMessage(inboxRecord, inboxPath)}`);
     }
   }
   if (audio) {
@@ -335,10 +394,11 @@ async function handleMessage(message) {
       attachmentPath: inboxPath,
       mediaId: inboxRecord?.mediaId || "",
       messageId: String(message.message_id || ""),
+      replyToMessageId: String(message.reply_to_message?.message_id || ""),
       at: new Date().toISOString(),
     });
     saveState();
-    if (!inboxEchoSent) await sendMessage(chatId, formatSavedInboxMessage(inboxRecord, inboxPath));
+    if (!inboxEchoSent) await sendBridgeMessage(target, formatSavedInboxMessage(inboxRecord, inboxPath));
     return;
   }
   let replyInboxContext = null;
@@ -346,7 +406,7 @@ async function handleMessage(message) {
     try {
       replyInboxContext = await getReplyInboxContext(session, message);
     } catch (error) {
-      await sendMessage(chatId, `Файл из reply не найден в Inbox: ${error.message}`);
+      await sendBridgeMessage(target, `Файл из reply не найден в Inbox: ${error.message}`);
       return;
     }
   }
@@ -356,6 +416,8 @@ async function handleMessage(message) {
     text,
     adapter: "telegram",
     userId: String(userId || ""),
+    messageId: String(message.message_id || ""),
+    replyToMessageId: String(message.reply_to_message?.message_id || ""),
     at: new Date().toISOString(),
   });
   saveState();
@@ -367,7 +429,6 @@ async function handleMessage(message) {
     return;
   }
 
-  const workspaceCommand = parseWorkspaceCommand(text);
   if (workspaceCommand) {
     await handleWorkspaceCommand(target, session, workspaceCommand);
     return;
@@ -376,7 +437,7 @@ async function handleMessage(message) {
   const bridgeCommand = parseBridgeCommand(text);
   if (bridgeCommand) {
     if (!bridgeCommand.prompt) {
-      await sendMessage(chatId, `Usage: ${config.bridgeCommands[0]} <task>\nAdd --history when Codex needs recent dialog context.`);
+      await sendBridgeMessage(target, `Usage: ${config.bridgeCommands[0]} <task>\nAdd --history when Codex needs recent dialog context.`);
       return;
     }
     await runCodex(target, buildPrompt(session, bridgeCommand, text, replyInboxContext));
@@ -399,21 +460,21 @@ async function handleCommand(target, text) {
   switch (command) {
     case "/start":
     case "/help":
-      await sendMessage(chatId, helpText(), { reply_markup: statusKeyboard() });
+      await sendBridgeMessage(target, helpText(), { reply_markup: statusKeyboard() });
       return;
     case "/status":
-      await sendMessage(chatId, statusText(target.key), { reply_markup: statusKeyboard() });
+      await sendBridgeMessage(target, statusText(target.key), { reply_markup: statusKeyboard() });
       return;
     case "/new": {
       const session = getSession(target.key);
       delete session.threadId;
       saveState();
-      await sendMessage(chatId, "New Codex thread will be started on the next message.");
+      await sendBridgeMessage(target, "New Codex thread will be started on the next message.");
       return;
     }
     case "/resume": {
       const session = getSession(target.key);
-      await sendMessage(chatId, session.threadId ? `Will resume thread:\n${session.threadId}` : "No saved thread id yet.");
+      await sendBridgeMessage(target, session.threadId ? `Will resume thread:\n${session.threadId}` : "No saved thread id yet.");
       return;
     }
     case "/stop":
@@ -423,14 +484,14 @@ async function handleCommand(target, text) {
       const session = getSession(target.key);
       delete session.pendingAnswer;
       saveState();
-      await sendMessage(chatId, "Pending answer mode cleared.");
+      await sendBridgeMessage(target, "Pending answer mode cleared.");
       return;
     }
     case "/repo":
-      await sendMessage(chatId, "Choose workspace:", { reply_markup: repoKeyboard() });
+      await sendBridgeMessage(target, "Choose workspace:", { reply_markup: repoKeyboard() });
       return;
     case "/commands":
-      await sendMessage(chatId, workspaceCommandsText());
+      await sendBridgeMessage(target, workspaceCommandsText());
       return;
     case "/model": {
       const session = getSession(target.key);
@@ -438,62 +499,76 @@ async function handleCommand(target, text) {
         session.model = arg;
         saveState();
       }
-      await sendMessage(chatId, `Model: ${session.model || config.defaultModel || "Codex default"}`);
+      await sendBridgeMessage(target, `Model: ${session.model || config.defaultModel || "Codex default"}`);
       return;
     }
     case "/sandbox": {
       const session = getSession(target.key);
       if (arg) {
         if (!SANDBOX_MODES.includes(arg)) {
-          await sendMessage(chatId, `Allowed: /sandbox ${SANDBOX_MODES.join("|")}`);
+          await sendBridgeMessage(target, `Allowed: /sandbox ${SANDBOX_MODES.join("|")}`);
           return;
         }
         session.sandbox = arg;
         saveState();
       }
-      await sendMessage(chatId, `Sandbox: ${session.sandbox || config.defaultSandbox}`, { reply_markup: sandboxKeyboard() });
+      await sendBridgeMessage(target, `Sandbox: ${session.sandbox || config.defaultSandbox}`, { reply_markup: sandboxKeyboard() });
       return;
     }
     case "/approval": {
       const session = getSession(target.key);
       if (arg) {
         if (!APPROVAL_POLICIES.includes(arg)) {
-          await sendMessage(chatId, `Allowed: /approval ${APPROVAL_POLICIES.join("|")}`);
+          await sendBridgeMessage(target, `Allowed: /approval ${APPROVAL_POLICIES.join("|")}`);
           return;
         }
         session.approvalPolicy = arg;
         saveState();
       }
-      await sendMessage(chatId, `Approval: ${session.approvalPolicy || config.defaultApprovalPolicy}`, { reply_markup: approvalKeyboard() });
+      await sendBridgeMessage(target, `Approval: ${session.approvalPolicy || config.defaultApprovalPolicy}`, { reply_markup: approvalKeyboard() });
       return;
     }
     case "/diff":
       await runCodex(target, "Review the current git diff and summarize the important changes and risks. Do not modify files.");
       return;
     default:
-      await sendMessage(chatId, `Unknown command: ${command}\n\n${helpText()}`);
+      await sendBridgeMessage(target, `Unknown command: ${command}\n\n${helpText()}`);
+  }
+}
+
+async function handleGlobalCommandWithoutSession(chatId, text, replyToMessageId = "") {
+  const replyExtra = telegramReplyExtra(replyToMessageId);
+  const [command] = String(text || "").trim().split(/\s+/);
+  switch (command) {
+    case "/start":
+    case "/help":
+      await sendMessage(chatId, helpText(), replyExtra);
+      return true;
+    case "/commands":
+      await sendMessage(chatId, workspaceCommandsText(), replyExtra);
+      return true;
+    case "/repo":
+      await sendMessage(chatId, "Choose workspace:", { ...replyExtra, reply_markup: repoKeyboard() });
+      return true;
+    case "/status":
+      await sendMessage(chatId, "No active workspace session.", replyExtra);
+      return true;
+    default:
+      return false;
   }
 }
 
 async function handleWorkspaceCommand(target, session, workspaceCommand) {
-  const chatId = target.chatId;
-  const currentWorkdir = session.workdir || config.workspaces[0];
-  const switched = currentWorkdir !== workspaceCommand.workdir;
-
-  cancelRunningSession(target);
-  switchSessionWorkspace(session, workspaceCommand.workdir);
+  session.workdir = workspaceCommand.workdir;
+  session.workspaceCommand = workspaceCommand.alias;
+  session.lastUserActivityAt = new Date().toISOString();
   saveState();
 
   if (!workspaceCommand.prompt) {
-    await sendMessage(chatId, switched
-      ? `Workspace switched to /${workspaceCommand.alias}:\n${workspaceCommand.workdir}`
-      : `Workspace reset for /${workspaceCommand.alias}:\n${workspaceCommand.workdir}`);
+    await sendBridgeMessage(target, `Workspace session started:\n${workspaceCommand.workdir}`);
     return;
   }
 
-  if (switched) {
-    await sendMessage(chatId, `Workspace switched to /${workspaceCommand.alias}:\n${workspaceCommand.workdir}`);
-  }
   await runCodex(target, workspaceCommand.prompt);
 }
 
@@ -505,6 +580,13 @@ async function runCodex(target, prompt) {
 
   const session = getSession(target.key);
   const workdir = session.workdir || config.workspaces[0];
+  const workspaceKey = path.resolve(workdir);
+  const occupyingSessionKey = runningWorkspaces.get(workspaceKey);
+  if (occupyingSessionKey && occupyingSessionKey !== target.key) {
+    const occupyingSession = getSession(occupyingSessionKey);
+    await sendBridgeMessage(target, `Workspace is already running another session: /${occupyingSession.workspaceCommand || workspaceAliasForPath(occupyingSession.workdir)}. Reply later or stop that session with /stop.`);
+    return;
+  }
   const sandbox = session.sandbox || config.defaultSandbox;
   const approvalPolicy = session.approvalPolicy || config.defaultApprovalPolicy;
   const model = session.model || config.defaultModel;
@@ -522,10 +604,13 @@ async function runCodex(target, prompt) {
     final: "",
     lastEdit: 0,
     threadId: session.threadId || "",
+    expanded: false,
+    collapsedLineCount: COLLAPSED_LIVE_LOG_LINES,
   };
 
   const startMessage = await sendBridgeMessage(target, `Starting Codex in:\n${workdir}\n\nSandbox: ${sandbox}\nApproval: ${approvalPolicy}`);
   live.messageId = startMessage.message_id;
+  rememberLiveProgress(live);
 
   const child = spawn(config.codexBin, args, {
     cwd: workdir,
@@ -533,8 +618,9 @@ async function runCodex(target, prompt) {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  const run = { child, live, replaced: false };
+  const run = { child, live, replaced: false, workspaceKey };
   running.set(target.key, run);
+  runningWorkspaces.set(workspaceKey, target.key);
 
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
@@ -560,6 +646,7 @@ async function runCodex(target, prompt) {
     if (run.replaced) return;
     if (stdoutBuffer.trim()) handleJsonLine(live, session, stdoutBuffer.trim());
     if (running.get(target.key)?.child === child) running.delete(target.key);
+    if (runningWorkspaces.get(workspaceKey) === target.key) runningWorkspaces.delete(workspaceKey);
     saveState();
     addLive(live, code === 0 ? "completed" : `failed with exit code ${code}`);
     await flushLive(live, true);
@@ -650,17 +737,49 @@ function addLive(live, line) {
   const value = clean(line);
   if (!value) return;
   live.lines.push(`${new Date().toLocaleTimeString("en-GB")} ${value}`);
-  live.lines = live.lines.slice(-18);
+  live.lines = live.lines.slice(-EXPANDED_LIVE_LOG_LINES);
 }
 
 async function flushLive(live, force) {
   const now = Date.now();
   if (!force && now - live.lastEdit < config.liveUpdateIntervalMs) return;
   live.lastEdit = now;
-  const text = truncate(`Codex progress\n\n${live.lines.join("\n")}`, config.maxTelegramChars);
-  await editBridgeMessage(live.target, live.messageId, text, {
-    inline_keyboard: [[{ text: "Stop", callback_data: "stop" }, { text: "Status", callback_data: "status" }]],
-  }).catch(() => {});
+  await editBridgeMessage(live.target, live.messageId, renderLiveProgress(live), liveProgressKeyboard(live)).catch(() => {});
+}
+
+function renderLiveProgress(live) {
+  const limit = live.expanded ? EXPANDED_LIVE_LOG_LINES : (live.collapsedLineCount || COLLAPSED_LIVE_LOG_LINES);
+  const lines = live.lines.slice(-limit);
+  return truncate(lines.join("\n") || "Codex progress", config.maxTelegramChars);
+}
+
+function liveProgressKeyboard(live) {
+  return {
+    inline_keyboard: [[
+      { text: "Stop", callback_data: "stop" },
+      { text: "Status", callback_data: "status" },
+      { text: live.expanded ? "Less logs" : "More logs", callback_data: "logs:toggle" },
+    ]],
+  };
+}
+
+function rememberLiveProgress(live) {
+  if (!live?.target || !live.messageId) return;
+  liveProgressMessages.set(liveProgressKey(live.target.chatId, live.messageId), live);
+  while (liveProgressMessages.size > 100) {
+    const oldestKey = liveProgressMessages.keys().next().value;
+    liveProgressMessages.delete(oldestKey);
+  }
+}
+
+function findLiveProgress(target, message) {
+  const chatId = message?.chat?.id || target.chatId;
+  const messageId = message?.message_id || "";
+  return liveProgressMessages.get(liveProgressKey(chatId, messageId)) || running.get(target.key)?.live || null;
+}
+
+function liveProgressKey(chatId, messageId) {
+  return `${String(chatId || "").trim()}:${String(messageId || "").trim()}`;
 }
 
 async function stopRun(target) {
@@ -681,11 +800,69 @@ function getSession(sessionKey) {
   state.sessions ||= {};
   state.sessions[key] ||= {
     workdir: config.workspaces[0],
+    workspaceCommand: workspaceAliasForPath(config.workspaces[0]),
     sandbox: config.defaultSandbox,
     approvalPolicy: config.defaultApprovalPolicy,
     model: config.defaultModel,
   };
   return state.sessions[key];
+}
+
+function createTelegramWorkspaceSession(chatId, workspaceCommand) {
+  const now = new Date().toISOString();
+  const sessionId = createSessionId(workspaceCommand.alias);
+  const key = `telegram:${chatId}:${sessionId}`;
+  state.sessions ||= {};
+  state.sessions[key] = {
+    id: sessionId,
+    key,
+    adapter: "telegram",
+    chatId: String(chatId),
+    workdir: workspaceCommand.workdir,
+    workspaceCommand: workspaceCommand.alias,
+    sandbox: config.defaultSandbox,
+    approvalPolicy: config.defaultApprovalPolicy,
+    model: config.defaultModel,
+    createdAt: now,
+    lastUserActivityAt: now,
+    lastBotActivityAt: "",
+  };
+  setActiveTelegramSessionKey(chatId, key);
+  saveState();
+  return telegramTarget(chatId, key);
+}
+
+function createSessionId(alias) {
+  const stamp = new Date().toISOString().replace(/[-:T.Z]/g, "").slice(0, 14);
+  return `${alias}-${stamp}-${randomUUID().slice(0, 8)}`;
+}
+
+function getActiveTelegramSessionKey(chatId) {
+  state.telegramChats ||= {};
+  return state.telegramChats[String(chatId)]?.activeSessionKey || "";
+}
+
+function setActiveTelegramSessionKey(chatId, sessionKey) {
+  if (!chatId || !sessionKey) return;
+  state.telegramChats ||= {};
+  const key = String(chatId);
+  state.telegramChats[key] ||= {};
+  state.telegramChats[key].activeSessionKey = sessionKey;
+  const session = getSession(sessionKey);
+  session.lastUserActivityAt = new Date().toISOString();
+}
+
+function findTelegramSessionKeyByMessage(chatId, messageId) {
+  state.telegramMessageIndex ||= {};
+  return state.telegramMessageIndex[telegramMessageIndexKey(chatId, messageId)] || "";
+}
+
+function workspaceAliasForPath(workdir) {
+  const resolved = path.resolve(workdir || config.workspaces[0]);
+  for (const [alias, workspace] of config.workspaceCommands.entries()) {
+    if (path.resolve(workspace) === resolved) return alias;
+  }
+  return path.basename(resolved).toLowerCase().replace(/[^\w]+/g, "_");
 }
 
 function statusText(sessionKey) {
@@ -806,6 +983,7 @@ function cancelRunningSession(target) {
 
   run.replaced = true;
   running.delete(target.key);
+  if (run.workspaceKey && runningWorkspaces.get(run.workspaceKey) === target.key) runningWorkspaces.delete(run.workspaceKey);
   run.child.kill("SIGTERM");
   setTimeout(() => {
     if (!run.child.killed) run.child.kill("SIGKILL");
@@ -877,6 +1055,11 @@ function workspaceHelpLine() {
   return `/<workspace> [task] - switch workspace mode (${commands})`;
 }
 
+function firstWorkspaceCommandExample() {
+  const first = config.workspaceCommands.keys().next().value;
+  return first ? `/${first} <task>` : "/<workspace> <task>";
+}
+
 async function sendMessage(chatId, text, extra = {}) {
   const messageText = truncate(text, config.maxTelegramChars);
   const formatted = formatTelegramHtml(messageText);
@@ -933,18 +1116,29 @@ async function editMediaCallbackMessage(message, text, replyMarkup) {
   }
 }
 
-async function sendInboxMediaMessage(chatId, record) {
+async function sendInboxMediaMessage(target, record) {
   if (!record?.file?.path) return null;
-  return sendTelegramDocument(chatId, record.file.path, record.file.mimeType || "application/octet-stream", formatInboxMediaCaption(record), mediaKeyboard(record.mediaId));
+  const session = getSession(target.key);
+  const message = await sendTelegramDocument(
+    target.chatId,
+    record.file.path,
+    record.file.mimeType || "application/octet-stream",
+    withWorkspaceSignature(formatInboxMediaCaption(record), session),
+    mediaKeyboard(record.mediaId),
+    telegramSessionReplyExtra(session),
+  );
+  bindTelegramMessageToSession(target, message?.message_id);
+  return message;
 }
 
-async function sendTelegramDocument(chatId, filePath, mimeType, caption, replyMarkup) {
+async function sendTelegramDocument(chatId, filePath, mimeType, caption, replyMarkup, extra = {}) {
   const form = new FormData();
   const fileName = path.basename(filePath);
   form.append("chat_id", String(chatId));
   form.append("document", new Blob([readFileSync(filePath)], { type: mimeType }), fileName);
   form.append("caption", truncate(caption, 1000));
   if (replyMarkup) form.append("reply_markup", JSON.stringify(replyMarkup));
+  appendTelegramMultipartExtra(form, extra);
   return telegramMultipart("sendDocument", form);
 }
 
@@ -955,8 +1149,9 @@ async function answerCallback(callbackQueryId, text) {
   });
 }
 
-function telegramTarget(chatId) {
-  return { adapter: "telegram", key: "telegram", chatId };
+function telegramTarget(chatId, sessionKey = "") {
+  const key = sessionKey || getActiveTelegramSessionKey(chatId) || "telegram";
+  return { adapter: "telegram", key, chatId };
 }
 
 function collabmdTarget(sessionId) {
@@ -964,25 +1159,125 @@ function collabmdTarget(sessionId) {
 }
 
 async function sendBridgeMessage(target, text, extra = {}) {
-  if (target.adapter === "telegram") return sendMessage(target.chatId, text, extra);
+  if (target.adapter === "telegram") {
+    const session = getSession(target.key);
+    const message = await sendMessage(target.chatId, withWorkspaceSignature(text, session), {
+      ...telegramSessionReplyExtra(session),
+      ...extra,
+    });
+    session.lastBotActivityAt = new Date().toISOString();
+    bindTelegramMessageToSession(target, message?.message_id);
+    return message;
+  }
   return pushCollabmdOutbox(target.sessionId, "message", { text: truncate(text, config.maxTelegramChars), extra });
 }
 
 async function sendBridgeLong(target, text) {
-  if (target.adapter === "telegram") return sendLong(target.chatId, text);
+  if (target.adapter === "telegram") return sendSessionLong(target, text);
   const chunks = chunkText(text, config.maxTelegramChars);
   for (const chunk of chunks) await sendBridgeMessage(target, chunk);
 }
 
+async function sendSessionLong(target, text) {
+  const session = getSession(target.key);
+  const signed = withWorkspaceSignature(text, session);
+  const chunks = chunkTelegramHtmlText(signed, config.maxTelegramChars);
+  const replyExtra = telegramSessionReplyExtra(session);
+  for (const chunk of chunks) {
+    let message;
+    try {
+      message = await telegram("sendMessage", {
+        chat_id: target.chatId,
+        text: chunk.html,
+        parse_mode: "HTML",
+        ...replyExtra,
+      });
+    } catch (error) {
+      if (!isTelegramParseError(error)) throw error;
+      message = await telegram("sendMessage", {
+        chat_id: target.chatId,
+        text: truncate(chunk.raw, config.maxTelegramChars),
+        ...replyExtra,
+      });
+    }
+    session.lastBotActivityAt = new Date().toISOString();
+    bindTelegramMessageToSession(target, message?.message_id);
+  }
+}
+
 async function editBridgeMessage(target, messageId, text, replyMarkup) {
   if (target.adapter === "telegram") {
-    return editTelegramMessageText(target.chatId, messageId, text, replyMarkup);
+    const session = getSession(target.key);
+    session.lastBotActivityAt = new Date().toISOString();
+    bindTelegramMessageToSession(target, messageId);
+    return editTelegramMessageText(target.chatId, messageId, withWorkspaceSignature(text, session), replyMarkup);
   }
   return pushCollabmdOutbox(target.sessionId, "edit", {
     message_id: messageId,
     text: truncate(text, config.maxTelegramChars),
     reply_markup: replyMarkup,
   });
+}
+
+function withWorkspaceSignature(text, session) {
+  const signature = workspaceSignature(session);
+  const value = String(text || "");
+  if (!signature) return value;
+  if (value.trimEnd().endsWith(signature)) return value;
+  return `${value.trimEnd()}\n\n${signature}`;
+}
+
+function workspaceSignature(session) {
+  const alias = String(session?.workspaceCommand || workspaceAliasForPath(session?.workdir) || "").trim();
+  return alias ? `/${alias}` : "";
+}
+
+function rememberTelegramUserMessage(target, message) {
+  if (target.adapter !== "telegram" || !message?.message_id || !target.key || target.key === "telegram") return;
+  const session = getSession(target.key);
+  session.lastUserTelegramMessageId = String(message.message_id);
+  session.lastUserActivityAt = new Date().toISOString();
+  saveState();
+}
+
+function telegramSessionReplyExtra(session) {
+  return telegramReplyExtra(session?.lastUserTelegramMessageId);
+}
+
+function telegramReplyExtra(messageId) {
+  const id = Number(messageId);
+  if (!Number.isSafeInteger(id) || id <= 0) return {};
+  return {
+    reply_parameters: {
+      message_id: id,
+      allow_sending_without_reply: true,
+    },
+  };
+}
+
+function appendTelegramMultipartExtra(form, extra = {}) {
+  for (const [key, value] of Object.entries(extra || {})) {
+    if (value === undefined || value === null) continue;
+    form.append(key, typeof value === "object" ? JSON.stringify(value) : String(value));
+  }
+}
+
+function bindTelegramMessageToSession(target, messageId) {
+  if (target.adapter !== "telegram" || !messageId || !target.key || target.key === "telegram") return;
+  state.telegramMessageIndex ||= {};
+  state.telegramMessageIndex[telegramMessageIndexKey(target.chatId, messageId)] = target.key;
+  const session = getSession(target.key);
+  session.telegramMessageIds ||= [];
+  const id = String(messageId);
+  if (!session.telegramMessageIds.includes(id)) {
+    session.telegramMessageIds.push(id);
+    session.telegramMessageIds = session.telegramMessageIds.slice(-500);
+  }
+  saveState();
+}
+
+function telegramMessageIndexKey(chatId, messageId) {
+  return `${String(chatId || "").trim()}:${String(messageId || "").trim()}`;
 }
 
 async function editTelegramMessageText(chatId, messageId, text, replyMarkup) {
@@ -1170,6 +1465,7 @@ function appendHistory(session, item) {
     attachmentPath: item.attachmentPath || "",
     mediaId: item.mediaId || "",
     messageId: item.messageId || "",
+    replyToMessageId: item.replyToMessageId || "",
     at: item.at || new Date().toISOString(),
   });
   session.history = session.history.slice(-Math.max(config.maxHistoryMessages * 3, 50));
