@@ -23,6 +23,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 - Workspaces are configured only in `.env`: `WORKSPACE_ALLOWLIST` is the comma-separated list of allowed absolute paths, and `WORKSPACE_COMMANDS` maps slash aliases to paths from that allowlist.
 - Telegram session key is global (`telegram`), so workspace switches/reset affect the whole Telegram bridge session.
 - Uploaded media goes under `<workspace>/Inbox`; update media metadata via `scripts/media-index`, not by hand-editing `.media-index.json`.
+- Telegram voice prompts reuse the STT progress message as the Codex live progress log to avoid extra `Transcribed` chat messages.
 - If behavior, config, workspace handling, service setup, or media flow changes, update this file in the same change.
 
 ## Run/Check

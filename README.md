@@ -137,11 +137,11 @@ Use `media-index describe` instead of editing `.media-index.json` by hand. The h
 
 Use `media-index send` when Codex finds a relevant local file and should forward it back to the Telegram user. The argument can be an indexed `mediaId` or a file path inside the workspace. A path is first added to the media index as a local media item, then sent with the same inline `Info` and `Delete` controls as Inbox uploads. By default the destination is the media item's Telegram chat when present, otherwise the first `ALLOWED_USER_IDS` entry; pass `--chat-id <id>` to override it.
 
-Voice and audio messages can be transcribed and saved into dialog history. The transcript is sent to Codex only when it contains a bridge command, or when Codex is waiting for an explicit answer. Enable local STT in `.env`:
+Voice and audio messages can be transcribed and saved into dialog history. Telegram voice messages recorded directly in chat are treated as user prompts: the bridge transcribes them, sends the transcript to Codex, and keeps the transcript in the same live progress message. Uploaded audio files are saved as media and only sent to Codex when the transcript contains a bridge command, or when Codex is waiting for an explicit answer. Enable local STT in `.env`:
 
 ```bash
 STT_COMMAND=scripts/transcribe-faster-whisper
-LOCAL_WHISPER_MODEL=Systran/faster-whisper-base
+LOCAL_WHISPER_MODEL=Systran/faster-whisper-small
 LOCAL_WHISPER_LANGUAGE=ru
 ```
 

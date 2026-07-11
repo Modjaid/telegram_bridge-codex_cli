@@ -10,7 +10,7 @@ const apiKey = process.env.OPENAI_API_KEY;
 if (!apiKey) fail("OPENAI_API_KEY is required");
 
 const baseUrl = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
-const model = process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1";
+const model = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-transcribe";
 const language = process.env.OPENAI_TRANSCRIBE_LANGUAGE || "";
 const prompt = process.env.OPENAI_TRANSCRIBE_PROMPT || "";
 

@@ -319,7 +319,8 @@ async function handleMessage(message) {
   const text = (message.text || "").trim();
   const audio = getAudioAttachment(message);
   const jsonDocument = getJsonDocumentAttachment(message);
-  const inboxAttachment = getInboxAttachment(message);
+  const voicePrompt = Boolean(message.voice?.file_id);
+  const inboxAttachment = voicePrompt ? null : getInboxAttachment(message);
   if (!text && !audio && !jsonDocument && !inboxAttachment) return;
 
   const workspaceCommand = parseWorkspaceCommand(text);
@@ -377,7 +378,7 @@ async function handleMessage(message) {
     }
   }
   if (audio) {
-    await handleAudioMessage(target, session, audio, inboxPath, inboxRecord);
+    await handleAudioMessage(target, session, audio, inboxPath, inboxRecord, { runAsPrompt: voicePrompt });
     return;
   }
   if (jsonDocument) {
@@ -572,9 +573,18 @@ async function handleWorkspaceCommand(target, session, workspaceCommand) {
   await runCodex(target, workspaceCommand.prompt);
 }
 
-async function runCodex(target, prompt) {
+async function runCodex(target, prompt, options = {}) {
+  const reusableMessageId = Number(options.liveMessageId || 0);
+  const sendOrEditStartMessage = async text => {
+    if (Number.isSafeInteger(reusableMessageId) && reusableMessageId > 0) {
+      await editBridgeMessage(target, reusableMessageId, text, undefined);
+      return { message_id: reusableMessageId };
+    }
+    return sendBridgeMessage(target, text);
+  };
+
   if (running.has(target.key)) {
-    await sendBridgeMessage(target, "A Codex turn is already running for this session. Use /stop to cancel it.");
+    await sendOrEditStartMessage("A Codex turn is already running for this session. Use /stop to cancel it.");
     return;
   }
 
@@ -584,12 +594,13 @@ async function runCodex(target, prompt) {
   const occupyingSessionKey = runningWorkspaces.get(workspaceKey);
   if (occupyingSessionKey && occupyingSessionKey !== target.key) {
     const occupyingSession = getSession(occupyingSessionKey);
-    await sendBridgeMessage(target, `Workspace is already running another session: /${occupyingSession.workspaceCommand || workspaceAliasForPath(occupyingSession.workdir)}. Reply later or stop that session with /stop.`);
+    await sendOrEditStartMessage(`Workspace is already running another session: /${occupyingSession.workspaceCommand || workspaceAliasForPath(occupyingSession.workdir)}. Reply later or stop that session with /stop.`);
     return;
   }
   const sandbox = session.sandbox || config.defaultSandbox;
   const approvalPolicy = session.approvalPolicy || config.defaultApprovalPolicy;
   const model = session.model || config.defaultModel;
+  const liveHeader = options.liveHeader ? truncate(clean(options.liveHeader), 1200) : "";
 
   const args = ["-a", approvalPolicy, "exec", "--json", "--sandbox", sandbox];
   if (model) args.push("--model", model);
@@ -606,9 +617,13 @@ async function runCodex(target, prompt) {
     threadId: session.threadId || "",
     expanded: false,
     collapsedLineCount: COLLAPSED_LIVE_LOG_LINES,
+    header: liveHeader,
   };
 
-  const startMessage = await sendBridgeMessage(target, `Starting Codex in:\n${workdir}\n\nSandbox: ${sandbox}\nApproval: ${approvalPolicy}`);
+  const startMessage = await sendOrEditStartMessage([
+    `Starting Codex in:\n${workdir}\n\nSandbox: ${sandbox}\nApproval: ${approvalPolicy}`,
+    liveHeader,
+  ].filter(Boolean).join("\n\n"));
   live.messageId = startMessage.message_id;
   rememberLiveProgress(live);
 
@@ -750,7 +765,7 @@ async function flushLive(live, force) {
 function renderLiveProgress(live) {
   const limit = live.expanded ? EXPANDED_LIVE_LOG_LINES : (live.collapsedLineCount || COLLAPSED_LIVE_LOG_LINES);
   const lines = live.lines.slice(-limit);
-  return truncate(lines.join("\n") || "Codex progress", config.maxTelegramChars);
+  return truncate([live.header, lines.join("\n") || "Codex progress"].filter(Boolean).join("\n\n"), config.maxTelegramChars);
 }
 
 function liveProgressKeyboard(live) {
@@ -1594,7 +1609,7 @@ function sendJson(res, statusCode, body) {
   res.end(data);
 }
 
-async function handleAudioMessage(target, session, audio, inboxPath = "", inboxRecord = null) {
+async function handleAudioMessage(target, session, audio, inboxPath = "", inboxRecord = null, options = {}) {
   if (running.has(target.key)) {
     await sendBridgeMessage(target, "A Codex turn is already running for this session. Use /stop to cancel it.");
     return;
@@ -1664,21 +1679,39 @@ async function handleAudioMessage(target, session, audio, inboxPath = "", inboxR
     });
     saveState();
 
-    await editBridgeMessage(target, progress.message_id, truncate(`Transcribed:\n\n${transcript}`, config.maxTelegramChars), undefined);
+    const liveHeader = formatAudioPromptLiveHeader(transcript);
     if (session.pendingAnswer) {
       delete session.pendingAnswer;
       saveState();
-      await runCodex(target, `User answer to your previous question, transcribed from an audio message:\n\n${transcript}`);
+      await runCodex(target, `User answer to your previous question, transcribed from an audio message:\n\n${transcript}`, {
+        liveHeader,
+        liveMessageId: progress.message_id,
+      });
+      return;
+    }
+    if (options.runAsPrompt) {
+      await runCodex(target, buildTextPrompt(transcript), {
+        liveHeader,
+        liveMessageId: progress.message_id,
+      });
       return;
     }
     const bridgeCommand = parseBridgeCommand(transcript);
-    if (bridgeCommand) await runCodex(target, buildPrompt(session, bridgeCommand, transcript));
-    else await sendBridgeMessage(target, `Transcript saved to dialog history. Start with ${config.bridgeCommands[0]} to send a task to Codex.`);
+    if (bridgeCommand) {
+      await runCodex(target, buildPrompt(session, bridgeCommand, transcript), { liveMessageId: progress.message_id });
+    } else {
+      await editBridgeMessage(target, progress.message_id, truncate(`Transcribed:\n\n${transcript}`, config.maxTelegramChars), undefined);
+      await sendBridgeMessage(target, `Transcript saved to dialog history. Start with ${config.bridgeCommands[0]} to send a task to Codex.`);
+    }
   } catch (error) {
     await editBridgeMessage(target, progress.message_id, `Audio transcription failed: ${error.message}`, undefined).catch(() => {});
   } finally {
     if (tempDir) rmSync(tempDir, { recursive: true, force: true });
   }
+}
+
+function formatAudioPromptLiveHeader(transcript) {
+  return `Audio transcript used as prompt:\n${transcript}`;
 }
 
 async function handleJsonDocumentMessage(target, session, document, caption, inboxPath = "", inboxRecord = null) {
