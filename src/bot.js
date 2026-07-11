@@ -1622,7 +1622,7 @@ function workspaceCommandsText() {
     "",
     ...entries.map(([alias, workdir]) => [
       `/${alias} - ${workdir}`,
-      `/delete_${alias}`,
+      `\`/delete_${alias}\``,
     ].join("\n")),
   ].join("\n");
 }
