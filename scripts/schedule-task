@@ -1,0 +1,217 @@
+#!/usr/bin/env node
+import path from "node:path";
+import {
+  deleteScheduleTask,
+  formatZonedDate,
+  getScheduleTask,
+  getScheduleUser,
+  listScheduleTasks,
+  loadScheduleStore,
+  nextCronRun,
+  setScheduleUserTimeZone,
+  upsertScheduleTask,
+  validateCron,
+} from "../src/schedule-store.js";
+
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+
+try {
+  main();
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
+
+function main() {
+  const [command, ...rest] = process.argv.slice(2);
+  const args = parseArgs(rest);
+  if (!command || command === "help" || command === "--help") return help();
+
+  if (command === "list") {
+    const chatId = required(args, "chat-id");
+    const store = loadScheduleStore(ROOT);
+    const user = getScheduleUser(store, chatId);
+    const tasks = listScheduleTasks(ROOT, chatId).map(task => ({
+      ...task,
+      nextRunAt: task.enabled ? nextCronRun(task.cron, task.timeZone)?.toISOString() || "" : "",
+      nextRunLocal: task.enabled ? formatZonedDate(nextCronRun(task.cron, task.timeZone), task.timeZone) : "",
+    }));
+    return print(args.json ? { user: { chatId: String(chatId), timeZone: user.timeZone }, tasks } : formatList(user, tasks));
+  }
+
+  if (command === "show") {
+    const task = getScheduleTask(ROOT, required(args, "chat-id"), required(args, "name"));
+    if (!task) throw new Error("Task not found");
+    return print(task);
+  }
+
+  if (command === "set-timezone") {
+    const user = setScheduleUserTimeZone(ROOT, required(args, "chat-id"), required(args, "timezone"));
+    return print({ ok: true, user });
+  }
+
+  if (command === "upsert") {
+    const task = upsertScheduleTask(ROOT, required(args, "chat-id"), {
+      name: required(args, "name"),
+      title: args.title || args.name || "",
+      description: args.description || "",
+      cron: required(args, "cron"),
+      timeZone: required(args, "timezone"),
+      workspace: required(args, "workspace"),
+      prompt: required(args, "prompt"),
+      status: args.status || (args.enabled === undefined ? "enabled" : undefined),
+      enabled: args.enabled === undefined ? true : !["0", "false", "no", "off"].includes(String(args.enabled).toLowerCase()),
+    });
+    return print({ ok: true, task });
+  }
+
+  if (command === "patch") {
+    const chatId = required(args, "chat-id");
+    const existing = requireTask(chatId, required(args, "name"));
+    const newName = args["new-name"] || existing.name;
+    const task = upsertScheduleTask(ROOT, chatId, {
+      ...existing,
+      name: newName,
+      title: args.title ?? existing.title,
+      description: args.description ?? existing.description,
+      cron: args.cron ?? existing.cron,
+      timeZone: args.timezone ?? existing.timeZone,
+      workspace: args.workspace ?? existing.workspace,
+      prompt: args.prompt ?? existing.prompt,
+      status: args.status ?? existing.status,
+      enabled: statusToEnabled(args.status, existing.enabled),
+    });
+    if (newName !== existing.name) deleteScheduleTask(ROOT, chatId, existing.name);
+    return print({ ok: true, task, renamedFrom: newName !== existing.name ? existing.name : "" });
+  }
+
+  if (command === "enable" || command === "disable") {
+    const chatId = required(args, "chat-id");
+    const existing = requireTask(chatId, required(args, "name"));
+    const status = command === "enable" ? "enabled" : "disabled";
+    const task = upsertScheduleTask(ROOT, chatId, {
+      ...existing,
+      status,
+      enabled: status === "enabled",
+    });
+    return print({ ok: true, task });
+  }
+
+  if (command === "rename") {
+    const chatId = required(args, "chat-id");
+    const existing = requireTask(chatId, required(args, "name"));
+    const newName = required(args, "new-name");
+    const task = upsertScheduleTask(ROOT, chatId, {
+      ...existing,
+      name: newName,
+      title: args.title ?? existing.title,
+    });
+    deleteScheduleTask(ROOT, chatId, existing.name);
+    return print({ ok: true, task, renamedFrom: existing.name });
+  }
+
+  if (command === "next") {
+    const task = requireTask(required(args, "chat-id"), required(args, "name"));
+    const next = task.enabled ? nextCronRun(task.cron, task.timeZone) : null;
+    return print({
+      ok: true,
+      task: { id: task.id, name: task.name, title: task.title },
+      nextRunAt: next?.toISOString() || "",
+      nextRunLocal: next ? formatZonedDate(next, task.timeZone) : "",
+      timeZone: task.timeZone,
+    });
+  }
+
+  if (command === "validate-cron") {
+    const cron = required(args, "cron");
+    validateCron(cron);
+    const timeZone = args.timezone || "UTC";
+    const next = nextCronRun(cron, timeZone);
+    return print({
+      ok: true,
+      cron,
+      timeZone,
+      nextRunAt: next?.toISOString() || "",
+      nextRunLocal: next ? formatZonedDate(next, timeZone) : "",
+    });
+  }
+
+  if (command === "delete") {
+    const task = deleteScheduleTask(ROOT, required(args, "chat-id"), required(args, "name"));
+    return print({ ok: true, deleted: Boolean(task), task });
+  }
+
+  throw new Error(`Unknown command: ${command}`);
+}
+
+function parseArgs(argv) {
+  const args = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith("--")) throw new Error(`Unexpected argument: ${token}`);
+    const key = token.slice(2);
+    if (key === "json") {
+      args.json = true;
+      continue;
+    }
+    const value = argv[index + 1];
+    if (value === undefined) throw new Error(`Missing value for --${key}`);
+    args[key] = value;
+    index += 1;
+  }
+  return args;
+}
+
+function required(args, key) {
+  const value = args[key];
+  if (value === undefined || value === "") throw new Error(`--${key} is required`);
+  return value;
+}
+
+function requireTask(chatId, name) {
+  const task = getScheduleTask(ROOT, chatId, name);
+  if (!task) throw new Error(`Task not found: ${name}`);
+  return task;
+}
+
+function statusToEnabled(status, fallback) {
+  if (status === undefined) return fallback;
+  return !["disabled", "paused", "0", "false", "no", "off"].includes(String(status).toLowerCase());
+}
+
+function formatList(user, tasks) {
+  if (!tasks.length) return `User time zone: ${user.timeZone || "not set"}\nNo schedule tasks.`;
+  return [
+    `User time zone: ${user.timeZone || "not set"}`,
+    "",
+    ...tasks.map(task => [
+      `${task.status || (task.enabled ? "enabled" : "disabled")}: ${task.title || task.name} (${task.id})`,
+      task.description ? `does: ${task.description}` : "",
+      `runs: ${task.cron} (${task.timeZone})`,
+      task.nextRunLocal ? `next: ${task.nextRunLocal} ${task.timeZone}` : "",
+      `workspace: ${task.workspace}`,
+      `edit: /edit_task_${task.id}`,
+      `delete: /delete_task_${task.id}`,
+    ].filter(Boolean).join("\n")),
+  ].join("\n\n");
+}
+
+function print(value) {
+  if (typeof value === "string") console.log(value);
+  else console.log(JSON.stringify(value, null, 2));
+}
+
+function help() {
+  console.log(`Usage:
+  schedule-task list --chat-id <id> [--json]
+  schedule-task show --chat-id <id> --name <taskName>
+  schedule-task set-timezone --chat-id <id> --timezone <IANA zone>
+  schedule-task upsert --chat-id <id> --name <taskName> [--title <text>] --description <text> --cron "0 9 * * *" --timezone <IANA zone> --workspace <path> --prompt <text> [--status enabled|disabled]
+  schedule-task patch --chat-id <id> --name <taskNameOrId> [--new-name <taskName>] [--title <text>] [--description <text>] [--cron "0 9 * * *"] [--timezone <IANA zone>] [--workspace <path>] [--prompt <text>] [--status enabled|disabled]
+  schedule-task enable --chat-id <id> --name <taskNameOrId>
+  schedule-task disable --chat-id <id> --name <taskNameOrId>
+  schedule-task rename --chat-id <id> --name <taskNameOrId> --new-name <taskName> [--title <text>]
+  schedule-task next --chat-id <id> --name <taskNameOrId>
+  schedule-task validate-cron --cron "0 9 * * *" [--timezone <IANA zone>]
+  schedule-task delete --chat-id <id> --name <taskNameOrId>`);
+}

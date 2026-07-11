@@ -14,10 +14,25 @@ import {
   peekMediaByTelegramMessage,
   upsertMediaRecord,
 } from "./media-index.js";
+import {
+  formatZonedDate,
+  getScheduleTask,
+  getScheduleUser,
+  listScheduleTasks,
+  listScheduleUsers,
+  loadScheduleStore,
+  markScheduleTaskRun,
+  matchesCronAt,
+  nextCronRun,
+  refreshScheduleTaskNextRun,
+  scheduleRunKey,
+  timeZoneOffsetMinutes,
+} from "./schedule-store.js";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const STATE_DIR = path.join(ROOT, "state");
 const STATE_FILE = path.join(STATE_DIR, "state.json");
+const SCHEDULE_WORKSPACE = ROOT;
 
 loadDotEnv(path.join(ROOT, ".env"));
 
@@ -45,6 +60,7 @@ const config = {
   bridgeCommands: csv(process.env.BRIDGE_COMMANDS || "/codex,@codex,codex:"),
   includeHistoryByDefault: parseBool(process.env.CODEX_INCLUDE_HISTORY_BY_DEFAULT || "false"),
   maxHistoryMessages: Number(process.env.BRIDGE_MAX_HISTORY_MESSAGES || 40),
+  scheduleTickMs: Number(process.env.SCHEDULE_TICK_MS || 60000),
   collabmdEnabled: parseBool(process.env.COLLABMD_ADAPTER_ENABLED || "false"),
   collabmdHost: process.env.COLLABMD_BRIDGE_HOST || "127.0.0.1",
   collabmdPort: Number(process.env.COLLABMD_BRIDGE_PORT || 17891),
@@ -77,6 +93,7 @@ const APPROVAL_POLICIES = ["untrusted", "on-request", "on-failure", "never"];
 const COLLAPSED_LIVE_LOG_LINES = 3;
 const TOGGLED_COLLAPSED_LIVE_LOG_LINES = 1;
 const EXPANDED_LIVE_LOG_LINES = 20;
+const SCHEDULE_SESSION_ALIAS = "schedule";
 
 console.log("Codex Bridge started");
 console.log(`Telegram adapter: ${config.telegramEnabled ? "enabled" : "disabled"}`);
@@ -84,6 +101,7 @@ if (config.telegramEnabled) console.log(`Allowed Telegram users: ${config.allowe
 console.log(`Default workspace: ${config.workspaces[0]}`);
 console.log(`Workspace commands: ${formatWorkspaceCommands(config.workspaceCommands) || "none"}`);
 console.log(`Bridge commands: ${config.bridgeCommands.join(", ")}`);
+if (config.telegramEnabled) startScheduleRunner();
 if (config.collabmdEnabled) startCollabmdHttpAdapter();
 if (config.telegramEnabled) await runTelegramAdapter();
 
@@ -114,6 +132,7 @@ async function runTelegramAdapter() {
 async function syncTelegramCommandMenu() {
   const commands = [
     { command: "commands", description: "List workspace commands" },
+    { command: "schedule", description: "Manage scheduled Codex tasks" },
   ];
   const scopes = [
     { label: "default", payload: {} },
@@ -140,7 +159,7 @@ async function syncTelegramCommandMenu() {
     }
   }
 
-  console.log("Telegram command menu synced: /commands");
+  console.log("Telegram command menu synced: /commands, /schedule");
 }
 
 async function handleUpdate(update) {
@@ -323,6 +342,16 @@ async function handleMessage(message) {
   const inboxAttachment = voicePrompt ? null : getInboxAttachment(message);
   if (!text && !audio && !jsonDocument && !inboxAttachment) return;
 
+  const scheduleCommand = parseScheduleCommand(text);
+  if (scheduleCommand) {
+    await handleScheduleCommandMessage(message, scheduleCommand);
+    return;
+  }
+
+  if (!text.startsWith("/") && activatePendingScheduleSession(chatId)) {
+    bindTelegramMessageToSession(telegramTarget(chatId, getActiveTelegramSessionKey(chatId)), message.message_id);
+  }
+
   const workspaceCommand = parseWorkspaceCommand(text);
   let target = null;
   let session = null;
@@ -422,6 +451,15 @@ async function handleMessage(message) {
     at: new Date().toISOString(),
   });
   saveState();
+
+  if (session.scheduleMode) {
+    clearPendingScheduleSession(chatId);
+    await runCodex(target, buildSchedulePrompt(session, text, {
+      action: session.scheduleAction || "dialog",
+      taskRef: session.scheduleTaskRef || "",
+    }));
+    return;
+  }
 
   if (session.pendingAnswer && !text.startsWith("/")) {
     delete session.pendingAnswer;
@@ -532,6 +570,9 @@ async function handleCommand(target, text) {
     case "/diff":
       await runCodex(target, "Review the current git diff and summarize the important changes and risks. Do not modify files.");
       return;
+    case "/schedule":
+      await handleScheduleCommandMessage({ chat: { id: chatId }, message_id: "", text }, { action: "open", rest: arg });
+      return;
     default:
       await sendBridgeMessage(target, `Unknown command: ${command}\n\n${helpText()}`);
   }
@@ -551,12 +592,391 @@ async function handleGlobalCommandWithoutSession(chatId, text, replyToMessageId 
     case "/repo":
       await sendMessage(chatId, "Choose workspace:", { ...replyExtra, reply_markup: repoKeyboard() });
       return true;
+    case "/schedule":
+      await handleScheduleCommandMessage({ chat: { id: chatId }, message_id: replyToMessageId, text }, { action: "open", rest: String(text || "").replace(/^\/schedule(?:@[A-Za-z0-9_]+)?/i, "").trim() });
+      return true;
     case "/status":
       await sendMessage(chatId, "No active workspace session.", replyExtra);
       return true;
     default:
       return false;
   }
+}
+
+async function handleScheduleCommandMessage(message, scheduleCommand) {
+  const chatId = message.chat.id;
+  const currentWorkspace = currentTelegramWorkspace(chatId);
+  const target = createTelegramScheduleSession(chatId, {
+    currentWorkspace,
+    action: scheduleCommand.action,
+    taskRef: scheduleCommand.taskRef || "",
+  });
+  const session = getSession(target.key);
+  if (message.message_id) {
+    rememberTelegramUserMessage(target, message);
+    bindTelegramMessageToSession(target, message.message_id);
+  }
+
+  if (scheduleCommand.action === "open" && !scheduleCommand.rest) {
+    await sendBridgeMessage(target, formatScheduleTaskList(chatId, currentWorkspace));
+    return;
+  }
+
+  if (scheduleCommand.action === "edit" && !scheduleCommand.rest) {
+    const task = getScheduleTask(ROOT, chatId, scheduleCommand.taskRef);
+    await sendBridgeMessage(target, task ? formatScheduleTaskDetails(task) : `Task not found: ${scheduleCommand.taskRef}`);
+    if (task) rememberPendingScheduleSession(chatId, target.key, task.id);
+    return;
+  }
+
+  const prompt = buildSchedulePrompt(session, scheduleCommand.rest || message.text || "", scheduleCommand);
+  await runCodex(target, prompt);
+}
+
+function parseScheduleCommand(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return null;
+  const scheduleMatch = trimmed.match(/^\/schedule(?:@[A-Za-z0-9_]+)?(?:\s+|$)([\s\S]*)/i);
+  if (scheduleMatch) return { action: "open", rest: (scheduleMatch[1] || "").trim() };
+  const editMatch = trimmed.match(/^\/edit_(?:task_)?([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s+|$)([\s\S]*)/i);
+  if (editMatch) return { action: "edit", taskRef: editMatch[1], rest: (editMatch[2] || "").trim() };
+  const deleteMatch = trimmed.match(/^\/delete_(?:task_)?([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s+|$)([\s\S]*)/i);
+  if (deleteMatch) return { action: "delete", taskRef: deleteMatch[1], rest: (deleteMatch[2] || "").trim() };
+  return null;
+}
+
+function createTelegramScheduleSession(chatId, options = {}) {
+  const now = new Date().toISOString();
+  const sessionId = createSessionId(SCHEDULE_SESSION_ALIAS);
+  const key = `telegram:${chatId}:${sessionId}`;
+  state.sessions ||= {};
+  state.sessions[key] = {
+    id: sessionId,
+    key,
+    adapter: "telegram",
+    chatId: String(chatId),
+    workdir: SCHEDULE_WORKSPACE,
+    workspaceCommand: SCHEDULE_SESSION_ALIAS,
+    scheduleMode: true,
+    scheduleCurrentWorkspace: options.currentWorkspace || config.workspaces[0],
+    scheduleAction: options.action || "open",
+    scheduleTaskRef: options.taskRef || "",
+    sandbox: config.defaultSandbox,
+    approvalPolicy: config.defaultApprovalPolicy,
+    model: config.defaultModel,
+    createdAt: now,
+    lastUserActivityAt: now,
+    lastBotActivityAt: "",
+  };
+  setActiveTelegramSessionKey(chatId, key);
+  saveState();
+  return telegramTarget(chatId, key);
+}
+
+function currentTelegramWorkspace(chatId) {
+  const activeKey = getActiveTelegramSessionKey(chatId);
+  const session = activeKey ? getSession(activeKey) : null;
+  const workdir = session?.scheduleMode ? session.scheduleCurrentWorkspace : session?.workdir;
+  return path.resolve(workdir || config.workspaces[0]);
+}
+
+function rememberPendingScheduleSession(chatId, sessionKey, taskId) {
+  state.telegramChats ||= {};
+  const key = String(chatId);
+  state.telegramChats[key] ||= {};
+  state.telegramChats[key].pendingScheduleSessionKey = sessionKey;
+  state.telegramChats[key].pendingScheduleTaskId = taskId || "";
+  state.telegramChats[key].pendingScheduleExpiresAt = new Date(Date.now() + 30 * 60000).toISOString();
+  saveState();
+}
+
+function activatePendingScheduleSession(chatId) {
+  const chat = state.telegramChats?.[String(chatId)];
+  const sessionKey = chat?.pendingScheduleSessionKey || "";
+  if (!sessionKey) return false;
+  if (chat.pendingScheduleExpiresAt && Date.parse(chat.pendingScheduleExpiresAt) < Date.now()) {
+    clearPendingScheduleSession(chatId);
+    return false;
+  }
+  const session = getSession(sessionKey);
+  if (!session.scheduleMode) {
+    clearPendingScheduleSession(chatId);
+    return false;
+  }
+  setActiveTelegramSessionKey(chatId, sessionKey);
+  saveState();
+  return true;
+}
+
+function clearPendingScheduleSession(chatId) {
+  const chat = state.telegramChats?.[String(chatId)];
+  if (!chat) return;
+  delete chat.pendingScheduleSessionKey;
+  delete chat.pendingScheduleTaskId;
+  delete chat.pendingScheduleExpiresAt;
+  saveState();
+}
+
+function formatScheduleTaskList(chatId, currentWorkspace) {
+  const workspace = path.resolve(currentWorkspace || config.workspaces[0]);
+  const tasks = listScheduleTasks(ROOT, chatId).filter(task => path.resolve(task.workspace) === workspace);
+  const now = new Date();
+  const header = `Schedule: /${workspaceAliasForPath(workspace)}`;
+  if (!tasks.length) {
+    return [
+      header,
+      "Нет задач для этого workspace.",
+    ].join("\n");
+  }
+  return [
+    header,
+    "",
+    ...tasks.map(task => formatScheduleTaskSummary(task, now)),
+  ].join("\n\n");
+}
+
+function formatScheduleTaskSummary(task, now = new Date()) {
+  return [
+    `${task.title || task.name}: ${task.description || "без описания"}`,
+    `Запуск: ${formatHumanSchedule(task, now)}`,
+    task.status === "disabled" || !task.enabled ? "Отключена" : "",
+    `Изменить: /edit_task_${task.id}`,
+    `Удалить: /delete_task_${task.id}`,
+  ].filter(Boolean).join("\n");
+}
+
+function formatScheduleTaskDetails(task, now = new Date()) {
+  const nextRun = task.nextRunAt || (task.enabled ? nextCronRun(task.cron, task.timeZone, now)?.toISOString() || "" : "");
+  const nextDate = nextRun ? new Date(nextRun) : null;
+  return [
+    `Task: ${task.title || task.name}`,
+    `id: ${task.id}`,
+    `name: ${task.name}`,
+    `description: ${task.description || ""}`,
+    `status: ${task.status || (task.enabled ? "enabled" : "disabled")}`,
+    `workspace: ${task.workspace}`,
+    `schedule: ${task.cron}`,
+    `time zone: ${task.timeZone}`,
+    `human schedule: ${formatHumanSchedule(task, now)}`,
+    nextDate ? `next run: ${formatZonedDate(nextDate, task.timeZone)} ${task.timeZone}` : "next run: none",
+    task.lastRunAt ? `last run: ${formatZonedDate(new Date(task.lastRunAt), task.timeZone)} ${task.timeZone}` : "last run: never",
+    "",
+    "prompt:",
+    task.prompt,
+    "",
+    `Delete: /delete_task_${task.id}`,
+    "Send what you want to change.",
+  ].filter(Boolean).join("\n");
+}
+
+function formatHumanSchedule(task, now = new Date()) {
+  if (task.status === "disabled" || !task.enabled) return "отключена";
+  const simple = simpleCronText(task.cron);
+  if (simple) return simple;
+  const nextRun = task.nextRunAt || nextCronRun(task.cron, task.timeZone, now)?.toISOString() || "";
+  if (!nextRun) return `${task.cron} (${task.timeZone})`;
+  return formatRelativeZonedDate(new Date(nextRun), task.timeZone, now);
+}
+
+function simpleCronText(cron) {
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = String(cron || "").trim().split(/\s+/);
+  if (!/^\d+$/.test(minute) || !/^\d+$/.test(hour)) return "";
+  const time = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+  if (dayOfMonth === "*" && month === "*" && dayOfWeek === "*") return `каждый день в ${time}`;
+  if (dayOfMonth === "*" && month === "*" && ["1-5", "1,2,3,4,5"].includes(dayOfWeek)) return `по будням в ${time}`;
+  return "";
+}
+
+function formatRelativeZonedDate(date, timeZone, now = new Date()) {
+  const target = zonedPartsForBot(date, timeZone);
+  const current = zonedPartsForBot(now, timeZone);
+  const targetDay = Date.UTC(target.year, target.month - 1, target.day);
+  const currentDay = Date.UTC(current.year, current.month - 1, current.day);
+  const dayDiff = Math.round((targetDay - currentDay) / 86400000);
+  const time = `${String(target.hour).padStart(2, "0")}:${String(target.minute).padStart(2, "0")}`;
+  if (dayDiff === 0) return `сегодня в ${time}`;
+  if (dayDiff === 1) return `завтра в ${time}`;
+  return `${String(target.day).padStart(2, "0")}.${String(target.month).padStart(2, "0")}.${target.year} в ${time}`;
+}
+
+function zonedPartsForBot(date, timeZone) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "numeric",
+    hour12: false,
+  }).formatToParts(date).filter(part => part.type !== "literal").map(part => [part.type, part.value]));
+  return {
+    year: Number(parts.year),
+    month: Number(parts.month),
+    day: Number(parts.day),
+    hour: Number(parts.hour) % 24,
+    minute: Number(parts.minute),
+  };
+}
+
+function buildSchedulePrompt(session, userText, command = {}) {
+  const chatId = session.chatId;
+  const store = loadScheduleStore(ROOT);
+  const user = getScheduleUser(store, chatId);
+  const systemTimeZone = getSystemTimeZone();
+  const now = new Date();
+  const selectedTask = command.taskRef || session.scheduleTaskRef ? getScheduleTask(ROOT, chatId, command.taskRef || session.scheduleTaskRef) : null;
+  const currentWorkspace = path.resolve(session.scheduleCurrentWorkspace || config.workspaces[0]);
+  return [
+    "You are in Telegram Bridge /schedule mode. Help the user create, edit, or delete persistent Codex cron tasks through dialog.",
+    "",
+    "Hard rules:",
+    "- Do not modify normal project files unless the user explicitly asks for it outside schedule management.",
+    "- Use the helper `schedule-task` to read and write schedule state. It is on PATH. Do not edit state/schedule-tasks.json by hand.",
+    "- Prefer purpose-built helper commands: use `upsert` for a new fully specified task, `patch` for partial edits, `enable`/`disable` for status-only changes, `rename` for name-only changes, `next` to inspect the next run, `validate-cron` to verify a cron expression, and `delete` only after deletion confirmation.",
+    "- Before creating or editing a task, collect enough details. If all required details are clear and the user's time zone is known, save immediately without asking for confirmation, then report the saved configuration briefly.",
+    "- Ask a confirmation question only when required details are ambiguous, missing, risky, or the user is asking to delete a task.",
+    "- Before deleting a task, ask for explicit confirmation. Delete only after confirmation.",
+    "- If a selected task is present, treat follow-up messages as edits to that task unless the user clearly switches context. Do not say you lack access to tasks; the selected task and existing tasks are provided below.",
+    "- For relative schedule edits, interpret `forward`, `later`, `вперёд`, `позже`, and `через` as moving the run later. For example, `на две минуты вперёд` means add 2 minutes to the selected task's cron time. Use `schedule-task patch` immediately when the edit is clear.",
+    "- If the user's time zone is unknown, ask for it before saving the first task. Save it with `schedule-task set-timezone --chat-id ... --timezone ...` once known.",
+    "- Use IANA time zones such as Europe/Berlin or America/New_York.",
+    "- Bind new tasks to the current Telegram workspace shown below unless the user explicitly chooses another allowed workspace.",
+    "- The prompt saved for a task must be the exact instruction that a future Codex CLI run should execute in that task workspace.",
+    "- Use a 5-field cron expression. Convert natural language schedules into cron in the user's time zone.",
+    "- Task names must be 1-48 chars and use only A-Z, a-z, 0-9, underscore.",
+    "- Use status enabled or disabled.",
+    "",
+    "Bridge/runtime context:",
+    `- chat_id: ${chatId}`,
+    `- current Telegram workspace for new tasks: ${currentWorkspace}`,
+    `- allowed workspaces: ${config.workspaces.join(", ")}`,
+    `- user time zone: ${user.timeZone || "unknown"}`,
+    `- bridge system time zone: ${systemTimeZone}`,
+    user.timeZone ? `- current user/system offset difference: ${formatOffsetDifference(user.timeZone, systemTimeZone, now)}` : "- current user/system offset difference: unknown until user time zone is set",
+    `- current instant: ${now.toISOString()}`,
+    "",
+    "Existing tasks:",
+    listScheduleTasks(ROOT, chatId).map(task => JSON.stringify(task)).join("\n") || "none",
+    "",
+    selectedTask ? `Selected task:\n${JSON.stringify(selectedTask, null, 2)}` : "",
+    "",
+    "Helper commands:",
+    `- schedule-task list --chat-id ${chatId} --json`,
+    `- schedule-task show --chat-id ${chatId} --name <task name or id>`,
+    `- schedule-task set-timezone --chat-id ${chatId} --timezone <IANA zone>`,
+    `- schedule-task upsert --chat-id ${chatId} --name <name> --title <title> --description <text> --cron "0 9 * * *" --timezone <IANA zone> --workspace <absolute path> --prompt <prompt> --status enabled`,
+    `- schedule-task patch --chat-id ${chatId} --name <task name or id> [--new-name <name>] [--title <title>] [--description <text>] [--cron "0 9 * * *"] [--timezone <IANA zone>] [--workspace <absolute path>] [--prompt <prompt>] [--status enabled|disabled]`,
+    `- schedule-task enable --chat-id ${chatId} --name <task name or id>`,
+    `- schedule-task disable --chat-id ${chatId} --name <task name or id>`,
+    `- schedule-task rename --chat-id ${chatId} --name <task name or id> --new-name <name> [--title <title>]`,
+    `- schedule-task next --chat-id ${chatId} --name <task name or id>`,
+    `- schedule-task validate-cron --cron "0 9 * * *" --timezone <IANA zone>`,
+    `- schedule-task delete --chat-id ${chatId} --name <task name or id>`,
+    "",
+    command.action === "edit" ? `The user invoked edit for task reference: ${command.taskRef}` : "",
+    command.action === "delete" ? `The user invoked delete for task reference: ${command.taskRef}` : "",
+    "",
+    "User message:",
+    userText || (command.action === "open" ? "Show the current schedule tasks and ask what to create or change." : ""),
+  ].filter(Boolean).join("\n");
+}
+
+function startScheduleRunner() {
+  const tick = () => {
+    void runDueScheduleTasks().catch(error => {
+      console.error("schedule runner error", error);
+    });
+  };
+  tick();
+  setInterval(tick, Math.max(1000, config.scheduleTickMs)).unref();
+}
+
+async function runDueScheduleTasks(now = new Date()) {
+  const users = listScheduleUsers(ROOT);
+  for (const user of users) {
+    for (const task of Object.values(user.tasks || {})) {
+      if (!task.enabled || task.status === "disabled") continue;
+      if (!matchesCronAt(task.cron, now, task.timeZone)) continue;
+      const runKey = scheduleRunKey(now, task.timeZone);
+      if (task.lastRunKey === runKey) continue;
+      if (!isAllowedWorkspace(task.workspace)) {
+        console.warn(`Skipping schedule task ${task.id || task.name}: workspace is not allowed: ${task.workspace}`);
+        refreshScheduleTaskNextRun(ROOT, user.chatId, task.id || task.name, now);
+        continue;
+      }
+      const workspaceKey = path.resolve(task.workspace);
+      if (runningWorkspaces.has(workspaceKey)) continue;
+      const target = createTelegramScheduledTaskSession(user.chatId, task);
+      markScheduleTaskRun(ROOT, user.chatId, task.id || task.name, runKey, now.toISOString());
+      await runCodex(target, buildScheduledTaskPrompt(task, now), {
+        liveHeader: `Scheduled task: ${task.title || task.name}\nWorkspace: ${task.workspace}`,
+      });
+    }
+  }
+}
+
+function createTelegramScheduledTaskSession(chatId, task) {
+  const now = new Date().toISOString();
+  const sessionId = createSessionId(`scheduled_${task.name}`);
+  const key = `telegram:${chatId}:${sessionId}`;
+  state.sessions ||= {};
+  state.sessions[key] = {
+    id: sessionId,
+    key,
+    adapter: "telegram",
+    chatId: String(chatId),
+    workdir: task.workspace,
+    workspaceCommand: workspaceAliasForPath(task.workspace),
+    scheduledTaskId: task.id || "",
+    scheduledTaskName: task.name || "",
+    sandbox: config.defaultSandbox,
+    approvalPolicy: config.defaultApprovalPolicy,
+    model: config.defaultModel,
+    createdAt: now,
+    lastUserActivityAt: "",
+    lastBotActivityAt: "",
+  };
+  saveState();
+  return telegramTarget(chatId, key);
+}
+
+function buildScheduledTaskPrompt(task, now) {
+  return [
+    "This is an automatic run of a Telegram Bridge schedule task.",
+    `Task id: ${task.id}`,
+    `Task name: ${task.name}`,
+    `Task title: ${task.title || task.name}`,
+    task.description ? `Description: ${task.description}` : "",
+    `Schedule: ${task.cron} (${task.timeZone})`,
+    `Scheduled instant: ${now.toISOString()}`,
+    `Workspace: ${task.workspace}`,
+    "",
+    "Execute the saved task instruction in this workspace. Report the result concisely to Telegram.",
+    "",
+    "Saved task instruction:",
+    task.prompt,
+  ].filter(Boolean).join("\n");
+}
+
+function isAllowedWorkspace(workspace) {
+  const resolved = path.resolve(workspace || "");
+  return config.workspaces.some(allowed => path.resolve(allowed) === resolved);
+}
+
+function getSystemTimeZone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+}
+
+function formatOffsetDifference(userTimeZone, systemTimeZone, date = new Date()) {
+  const userOffset = timeZoneOffsetMinutes(date, userTimeZone);
+  const systemOffset = timeZoneOffsetMinutes(date, systemTimeZone);
+  const diff = userOffset - systemOffset;
+  if (diff === 0) return "same offset";
+  const sign = diff > 0 ? "+" : "-";
+  const abs = Math.abs(diff);
+  const hours = Math.floor(abs / 60);
+  const minutes = abs % 60;
+  return `user is ${sign}${hours}:${String(minutes).padStart(2, "0")} relative to bridge system time`;
 }
 
 async function handleWorkspaceCommand(target, session, workspaceCommand) {
@@ -918,6 +1338,7 @@ function helpText() {
     "/cancel - clear pending answer mode",
     "/repo - choose workspace",
     "/commands - list workspace commands",
+    "/schedule - manage persistent Codex cron tasks",
     workspaceHelpLine(),
     "/model [name] - show or set model",
     "/sandbox [read-only|workspace-write|danger-full-access] - show or set sandbox",

@@ -41,6 +41,7 @@ If your selected workspace is not a Git repository, set `CODEX_SKIP_GIT_REPO_CHE
 - `/stop` - stop the current Codex process for this chat
 - `/cancel` - clear pending answer mode
 - `/repo` - choose workdir from `WORKSPACE_ALLOWLIST`
+- `/schedule` - open a schedule-management Codex session for persistent cron tasks
 - `/<workspace> [task]` - switch global Telegram workspace mode and start a fresh Codex thread
 - `/model [model]` - show or set model override
 - `/sandbox [read-only|workspace-write|danger-full-access]` - show or set sandbox
@@ -76,6 +77,40 @@ Examples:
 ```
 
 Using any workspace command clears the saved Codex thread, pending answer mode, and bridge history for the global Telegram session, even when the command selects the already active workspace. Follow-up plain text messages continue in the selected workspace until another workspace command is used.
+
+## Scheduled Codex Tasks
+
+Telegram `/schedule` opens a special Codex session in the bridge service workspace, not in a normal project workspace. The session receives schedule-specific instructions and can help create, edit, or delete cron tasks through dialog.
+
+Tasks are stored persistently in:
+
+```text
+state/schedule-tasks.json
+```
+
+Each task stores an id, name/title, description, cron expression, IANA time zone, linked workspace, saved Codex prompt, status, last run, next run, and run count. The bridge reloads this file after restart and resumes due tasks automatically.
+
+Useful commands:
+
+```text
+/schedule
+/schedule every day at 9am check new GitHub issues in the current project
+/edit_task_<id>
+/delete_task_<id>
+```
+
+When creating a task, the schedule session uses the currently selected Telegram workspace as the default workspace for that task. If the user switches workspace before creating another task, the new task is bound to the new workspace. On execution, Codex starts in the task's saved workspace.
+
+The schedule session asks for the user's IANA time zone before saving the first task. It also knows the bridge system time zone and calculates the current offset difference. The user time zone is persisted and reused in later `/schedule` sessions.
+
+Codex runs launched by `/schedule` get `scripts/` on `PATH`, so the schedule agent can manage state with:
+
+```bash
+schedule-task list --chat-id <id> --json
+schedule-task set-timezone --chat-id <id> --timezone Europe/Berlin
+schedule-task upsert --chat-id <id> --name daily_issues --title "Daily issues" --description "Check GitHub issues" --cron "0 9 * * *" --timezone Europe/Berlin --workspace /home/agent/project --prompt "Check new GitHub issues and summarize them." --status enabled
+schedule-task delete --chat-id <id> --name <task-name-or-id>
+```
 
 ## CollabMD
 
