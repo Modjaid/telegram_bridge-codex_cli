@@ -105,6 +105,10 @@ function main() {
     const previous = commands.get(alias);
     if (!previous) throw new Error(`Project command not found: /${alias}`);
     const project = path.resolve(required(args, "path"));
+    if (!existsSync(project) && args.create === "true") {
+      assertInside(createRoot, project);
+      mkdirSync(project, { recursive: true, mode: 0o700 });
+    }
     if (!existsSync(project) || !statSync(project).isDirectory()) {
       throw new Error(`Existing project directory not found: ${project}`);
     }
@@ -145,6 +149,20 @@ function main() {
       projects: remainingProjects,
       projectCommands: Object.fromEntries(commands),
     });
+  }
+
+  if (command === "detach") {
+    const alias = normalizeProjectName(required(args, "name"));
+    if (!alias) throw new Error("Project name must contain letters, numbers, underscore, or dash.");
+    const project = commands.get(alias);
+    if (!project) throw new Error(`Project command not found: /${alias}`);
+    for (const [commandAlias, commandProject] of commands.entries()) {
+      if (path.resolve(commandProject) === path.resolve(project)) commands.delete(commandAlias);
+    }
+    const remainingProjects = projects.filter(item => path.resolve(item) !== path.resolve(project));
+    if (remainingProjects.length === 0) throw new Error("Cannot detach the last allowed project.");
+    writeProjectEnv(env, remainingProjects, commands, createRoot);
+    return print({ ok: true, action: "detached", alias, project, folderRemoved: false, createRoot, projects: remainingProjects, projectCommands: Object.fromEntries(commands) });
   }
 
   throw new Error(`Unknown command: ${command}`);
@@ -283,6 +301,7 @@ function help() {
   project-manager list
   project-manager create --name <projectName> [--root <parentPath>]
   project-manager add --name <projectAlias> --path <existingFolder>
-  project-manager repoint --name <projectAlias> --path <existingFolder>
+  project-manager repoint --name <projectAlias> --path <folder> [--create true]
+  project-manager detach --name <projectAlias>
   project-manager delete --name <projectName> [--root <parentPath>]`);
 }

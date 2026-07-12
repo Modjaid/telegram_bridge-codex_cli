@@ -117,6 +117,7 @@ Project create/delete operations go through:
 ```bash
 scripts/project-manager create --name <projectName> --root <parentPath>
 scripts/project-manager repoint --name <projectAlias> --path <existingFolder>
+scripts/project-manager detach --name <projectAlias>
 scripts/project-manager delete --name <projectName>
 ```
 
