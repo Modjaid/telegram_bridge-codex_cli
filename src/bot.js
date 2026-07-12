@@ -18,6 +18,7 @@ import {
 import { runMediaTriggers } from "./media-triggers.js";
 import { installBundledSkills } from "./bundled-skills.js";
 import { projectSessionStartedText } from "./project-skills.js";
+import { PACKAGE_ROOT, resolveBridgePaths } from "./paths.js";
 import {
   formatZonedDate,
   getScheduleTask,
@@ -33,12 +34,13 @@ import {
   timeZoneOffsetMinutes,
 } from "./schedule-store.js";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-const STATE_DIR = path.join(ROOT, "state");
+const ROOT = PACKAGE_ROOT;
+const BRIDGE_PATHS = resolveBridgePaths();
+const STATE_DIR = BRIDGE_PATHS.stateRoot;
 const STATE_FILE = path.join(STATE_DIR, "state.json");
-const SCHEDULE_PROJECT = ROOT;
+const SCHEDULE_PROJECT = BRIDGE_PATHS.dataRoot;
 
-loadDotEnv(path.join(ROOT, ".env"));
+loadDotEnv(BRIDGE_PATHS.configFile);
 for (const result of installBundledSkills(ROOT)) {
   console.log(`Bundled skill ${result.name}: ${result.action}${result.version ? ` (${result.version})` : ""}`);
 }
@@ -670,7 +672,7 @@ async function handleScheduleCommandMessage(message, scheduleCommand) {
   }
 
   if (scheduleCommand.action === "edit" && !scheduleCommand.rest) {
-    const task = getScheduleTask(ROOT, chatId, scheduleCommand.taskRef);
+    const task = getScheduleTask(BRIDGE_PATHS.dataRoot, chatId, scheduleCommand.taskRef);
     await sendBridgeMessage(target, task ? formatScheduleTaskDetails(task) : `Task not found: ${scheduleCommand.taskRef}`);
     if (task) rememberPendingScheduleSession(chatId, target.key, task.id);
     return;
@@ -853,7 +855,7 @@ async function handleProjectDeleteCommand(chatId, projectDeleteCommand, replyToM
 
 function formatScheduleTaskList(chatId, currentProject) {
   const project = path.resolve(currentProject || config.projects[0]);
-  const tasks = listScheduleTasks(ROOT, chatId).filter(task => path.resolve(task.project) === project);
+  const tasks = listScheduleTasks(BRIDGE_PATHS.dataRoot, chatId).filter(task => path.resolve(task.project) === project);
   const now = new Date();
   const header = `Schedule: /${projectAliasForPath(project)}`;
   if (!tasks.length) {
@@ -954,18 +956,18 @@ function zonedPartsForBot(date, timeZone) {
 
 function buildSchedulePrompt(session, userText, command = {}) {
   const chatId = session.chatId;
-  const store = loadScheduleStore(ROOT);
+  const store = loadScheduleStore(BRIDGE_PATHS.dataRoot);
   const user = getScheduleUser(store, chatId);
   const systemTimeZone = getSystemTimeZone();
   const now = new Date();
-  const selectedTask = command.taskRef || session.scheduleTaskRef ? getScheduleTask(ROOT, chatId, command.taskRef || session.scheduleTaskRef) : null;
+  const selectedTask = command.taskRef || session.scheduleTaskRef ? getScheduleTask(BRIDGE_PATHS.dataRoot, chatId, command.taskRef || session.scheduleTaskRef) : null;
   const currentProject = path.resolve(session.scheduleCurrentProject || config.projects[0]);
   return [
     "You are in Telegram Bridge /schedule mode. Help the user create, edit, or delete persistent Codex cron tasks through dialog.",
     "",
     "Hard rules:",
     "- Do not modify normal project files unless the user explicitly asks for it outside schedule management.",
-    "- Use the helper `schedule-task` to read and write schedule state. It is on PATH. Do not edit state/schedule-tasks.json by hand.",
+    "- Use the helper `schedule-task` to read and write schedule state. It is on PATH. Do not edit the Bridge state files by hand.",
     "- Prefer purpose-built helper commands: use `upsert` for a new fully specified task, `patch` for partial edits, `enable`/`disable` for status-only changes, `rename` for name-only changes, `next` to inspect the next run, `validate-cron` to verify a cron expression, and `delete` only after deletion confirmation.",
     "- Before creating or editing a task, collect enough details. If all required details are clear and the user's time zone is known, save immediately without asking for confirmation, then report the saved configuration briefly.",
     "- Ask a confirmation question only when required details are ambiguous, missing, risky, or the user is asking to delete a task.",
@@ -990,7 +992,7 @@ function buildSchedulePrompt(session, userText, command = {}) {
     `- current instant: ${now.toISOString()}`,
     "",
     "Existing tasks:",
-    listScheduleTasks(ROOT, chatId).map(task => JSON.stringify(task)).join("\n") || "none",
+    listScheduleTasks(BRIDGE_PATHS.dataRoot, chatId).map(task => JSON.stringify(task)).join("\n") || "none",
     "",
     selectedTask ? `Selected task:\n${JSON.stringify(selectedTask, null, 2)}` : "",
     "",
@@ -1035,13 +1037,13 @@ async function runDueScheduleTasks(now = new Date()) {
       if (task.lastRunKey === runKey) continue;
       if (!isAllowedProject(task.project)) {
         console.warn(`Skipping schedule task ${task.id || task.name}: project is not allowed: ${task.project}`);
-        refreshScheduleTaskNextRun(ROOT, user.chatId, task.id || task.name, now);
+        refreshScheduleTaskNextRun(BRIDGE_PATHS.dataRoot, user.chatId, task.id || task.name, now);
         continue;
       }
       const projectKey = path.resolve(task.project);
       if (runningProjects.has(projectKey)) continue;
       const target = createTelegramScheduledTaskSession(user.chatId, task);
-      markScheduleTaskRun(ROOT, user.chatId, task.id || task.name, runKey, now.toISOString());
+      markScheduleTaskRun(BRIDGE_PATHS.dataRoot, user.chatId, task.id || task.name, runKey, now.toISOString());
       await runCodex(target, buildScheduledTaskPrompt(task, now), {
         liveHeader: `Scheduled task: ${task.title || task.name}\nProject: ${task.project}`,
       });
@@ -2214,7 +2216,7 @@ async function handleAudioMessage(target, session, audio, inboxPath = "", inboxR
       saveState();
     }
     const savedLine = inboxPath ? `${formatSavedInboxMessage(inboxRecord, inboxPath)}\n\n` : "";
-    await sendBridgeMessage(target, `${savedLine}STT is not configured. Set STT_COMMAND in .env and restart the bridge.`);
+    await sendBridgeMessage(target, `${savedLine}STT is not configured. Set STT_COMMAND in the Bridge config and restart the bridge.`);
     return;
   }
   if (audio.fileSize && audio.fileSize > config.maxAudioBytes) {
@@ -2891,7 +2893,7 @@ function resolveMediaCacheRoot() {
   const xdgCacheHome = process.env.XDG_CACHE_HOME
     ? path.resolve(process.env.XDG_CACHE_HOME)
     : path.join(homedir(), ".cache");
-  return path.resolve(process.env.TELEGRAM_MEDIA_CACHE_ROOT || path.join(xdgCacheHome, "codex-telegram-bridge", "telegram-media"));
+  return path.resolve(process.env.TELEGRAM_MEDIA_CACHE_ROOT || BRIDGE_PATHS.telegramMediaRoot);
 }
 
 function migrateLegacyMediaCache(target) {

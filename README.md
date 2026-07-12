@@ -13,7 +13,38 @@ The bridge listens to every adapter message and stores per-session dialog histor
 
 For CollabMD-only mode, set `TELEGRAM_ADAPTER_ENABLED=false` and `COLLABMD_ADAPTER_ENABLED=true`. In that mode `BOT_TOKEN` and `ALLOWED_USER_IDS` are not required.
 
-## Setup
+## Install and setup
+
+Requirements: Linux, Node.js 22+, npm, and Codex CLI.
+
+Install directly from GitHub, then run the interactive setup:
+
+```bash
+npm install -g github:Modjaid/telegram_bridge-codex_cli
+codex-telegram-bridge setup
+codex-telegram-bridge doctor
+```
+
+For automation, keep the bot token in a mode-0600 file rather than a command-line argument:
+
+```bash
+codex-telegram-bridge setup --token-file /secure/path/bot-token --user-id 123456789 --yes
+```
+
+Installed code is managed by npm. Configuration, projects, state, logs, and temporary Bridge data are kept under `~/.codex-telegram-bridge/`; Codex credentials in `~/.codex/` and Google Workspace MCP credentials are independent and are never copied or removed by Bridge.
+
+Useful lifecycle commands are `start`, `stop`, `restart`, `status`, `doctor`, `login`, `add-user`, `update`, and `uninstall`. Ordinary uninstall disables the user service but preserves data. `uninstall --purge --yes` also removes `~/.codex-telegram-bridge`, but never Codex or Google credentials.
+
+To migrate an existing checkout without deleting it:
+
+```bash
+codex-telegram-bridge migrate --from /path/to/old/codex-telegram-bridge
+codex-telegram-bridge doctor
+```
+
+Do not remove the old checkout until the installed service, Telegram commands, projects, schedules, Codex authorization, and optional Google MCP authorization have all been verified and a backup exists.
+
+## Development setup
 
 1. Create a bot with `@BotFather`.
 2. Copy `.env.example` to `.env`.
@@ -88,7 +119,7 @@ scripts/project-manager create --name <projectName> --root <parentPath>
 scripts/project-manager delete --name <projectName>
 ```
 
-Creation updates `.env`, creates the project directory under `PROJECT_CREATE_ROOT`, adds it to `PROJECT_ALLOWLIST` and `PROJECT_COMMANDS`, and creates an `AGENTS.md` file in the new project. Deletion recursively removes the project folder under `PROJECT_CREATE_ROOT`, then removes it from the bridge configuration.
+Creation updates the active Bridge config (`~/.codex-telegram-bridge/config.env` when installed), creates the project directory under `PROJECT_CREATE_ROOT`, adds it to `PROJECT_ALLOWLIST` and `PROJECT_COMMANDS`, and creates an `AGENTS.md` file in the new project. Deletion recursively removes the project folder under `PROJECT_CREATE_ROOT`, then removes it from the bridge configuration.
 
 ## Scheduled Codex Tasks
 
@@ -97,7 +128,7 @@ Telegram `/schedule` opens a special Codex session in the bridge's own service d
 Tasks are stored persistently in:
 
 ```text
-state/schedule-tasks.json
+~/.codex-telegram-bridge/state/schedule-tasks.json
 ```
 
 Each task stores an id, name/title, description, cron expression, IANA time zone, linked project, saved Codex prompt, status, last run, next run, and run count. The bridge reloads this file after restart and resumes due tasks automatically.

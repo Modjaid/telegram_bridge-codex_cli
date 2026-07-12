@@ -1,11 +1,29 @@
 {
   "name": "codex-telegram-bridge",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
+  "bin": {
+    "codex-telegram-bridge": "./bin/codex-telegram-bridge.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "scripts/media-event",
+    "scripts/media-index",
+    "scripts/project-manager",
+    "scripts/schedule-task",
+    "scripts/transcribe-faster-whisper",
+    "scripts/transcribe-faster-whisper.py",
+    "scripts/transcribe-openai.js",
+    "bundled-skills/",
+    "systemd/",
+    ".env.example",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node src/bot.js",
-    "check": "node --check src/bot.js && node --check src/bundled-skills.js && node --check src/media-index.js && node --check src/media-triggers.js && node --check src/project-skills.js && node --check src/schedule-store.js && node --check scripts/media-index && node --check scripts/media-event && node --check scripts/schedule-task && node --check scripts/project-manager && node test/bundled-skills.test.js && node test/media-triggers.test.js && node test/media-cache.test.js && node test/project-skills.test.js"
+    "check": "node --check src/bot.js && node --check src/cli.js && node --check src/paths.js && node --check src/bundled-skills.js && node --check src/media-index.js && node --check src/media-triggers.js && node --check src/project-skills.js && node --check src/schedule-store.js && node --check scripts/media-index && node --check scripts/media-event && node --check scripts/schedule-task && node --check scripts/project-manager && node test/bundled-skills.test.js && node test/media-triggers.test.js && node test/media-cache.test.js && node test/project-skills.test.js && node test/installer.test.js"
   },
   "engines": {
     "node": ">=22"

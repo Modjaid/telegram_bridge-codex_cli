@@ -17,9 +17,10 @@ import {
   upsertMediaRecord,
   validateMediaIndex,
 } from "../src/media-index.js";
+import { resolveBridgePaths } from "../src/paths.js";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-loadDotEnv(path.join(ROOT, ".env"));
+loadDotEnv(resolveBridgePaths().configFile);
 
 const { command, args, options } = parseArgs(process.argv.slice(2));
 
@@ -142,7 +143,7 @@ function print(options, value) {
 
 async function sendMedia(project, target, options) {
   const token = process.env.BOT_TOKEN || "";
-  if (!token) fail("BOT_TOKEN is required. Run this from the bridge environment or keep codex-telegram-bridge/.env readable.");
+  if (!token) fail("BOT_TOKEN is required. Run this from the Bridge environment or configure ~/.codex-telegram-bridge/config.env.");
 
   const item = resolveSendItem(project, target, options);
   const filePath = getMediaFilePath(project, item);

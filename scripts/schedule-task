@@ -12,8 +12,9 @@ import {
   upsertScheduleTask,
   validateCron,
 } from "../src/schedule-store.js";
+import { resolveBridgePaths } from "../src/paths.js";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const ROOT = resolveBridgePaths().dataRoot;
 
 try {
   main();

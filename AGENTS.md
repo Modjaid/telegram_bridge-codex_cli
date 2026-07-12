@@ -7,6 +7,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 ## Key Files
 
 - `src/bot.js` - main process: config, Telegram/CollabMD routing, session state, Codex spawning, media download/STT.
+- `src/paths.js` centralizes installed-package and persistent-data paths; `src/cli.js` implements the npm CLI.
 - `src/media-index.js` - locked, atomic shared media-cache index helpers.
 - `src/media-triggers.js` - discovers and runs project-skill media subscriptions.
 - `src/bundled-skills.js` and `bundled-skills/` - versioned skills installed into the service user's Codex home at Bridge startup.
@@ -22,7 +23,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 ## Change Rules
 
 - Use existing no-dependency Node style; package requires Node `>=22`.
-- Projects are configured only in `.env`: `PROJECT_ALLOWLIST` is the comma-separated list of allowed absolute paths, and `PROJECT_COMMANDS` maps slash aliases to paths from that allowlist.
+- Installed deployments use `~/.codex-telegram-bridge/config.env`; projects, state and logs live under that persistent data root and never under the npm package. `PROJECT_ALLOWLIST` is the comma-separated list of allowed absolute paths, and `PROJECT_COMMANDS` maps slash aliases to paths from that allowlist.
 - Telegram project create/attach/delete must go through `scripts/project-manager`; do not hand-edit `.env` for that flow. Created or attached projects must include an `AGENTS.md` file. Deleting a project recursively removes its folder and is restricted to paths inside `PROJECT_CREATE_ROOT`.
 - Telegram session key is global (`telegram`), so project switches/reset affect the whole Telegram bridge session.
 - Project-switch confirmations list global and project-local skills without duplicates, followed by a non-recursive first-level directory listing capped to fit a Telegram message.

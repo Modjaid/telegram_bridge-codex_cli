@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { resolveBridgePaths } from "../src/paths.js";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-const ENV_FILE = path.join(ROOT, ".env");
+const ENV_FILE = resolveBridgePaths().configFile;
 
 try {
   main();

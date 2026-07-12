@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/agent/codex-telegram-bridge
-ExecStart=/usr/bin/node /home/agent/codex-telegram-bridge/src/bot.js
-EnvironmentFile=/home/agent/codex-telegram-bridge/.env
+WorkingDirectory=%h/.codex-telegram-bridge
+ExecStart=codex-telegram-bridge run
+EnvironmentFile=%h/.codex-telegram-bridge/config.env
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=false
