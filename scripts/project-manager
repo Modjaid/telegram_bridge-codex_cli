@@ -99,6 +99,27 @@ function main() {
     });
   }
 
+  if (command === "repoint") {
+    const alias = normalizeProjectName(required(args, "name"));
+    if (!alias) throw new Error("Project name must contain letters, numbers, underscore, or dash.");
+    const previous = commands.get(alias);
+    if (!previous) throw new Error(`Project command not found: /${alias}`);
+    const project = path.resolve(required(args, "path"));
+    if (!existsSync(project) || !statSync(project).isDirectory()) {
+      throw new Error(`Existing project directory not found: ${project}`);
+    }
+    const agentsPath = path.join(project, "AGENTS.md");
+    if (!existsSync(agentsPath)) writeFileSync(agentsPath, defaultAgentsMd(alias), { mode: 0o600 });
+
+    const nextProjects = unique(projects.map(item => path.resolve(item) === path.resolve(previous) ? project : item));
+    for (const [commandAlias, commandProject] of commands.entries()) {
+      if (path.resolve(commandProject) === path.resolve(previous)) commands.set(commandAlias, project);
+    }
+    commands.set(alias, project);
+    writeProjectEnv(env, nextProjects, commands, createRoot);
+    return print({ ok: true, action: "repointed", alias, previous, project, agentsPath, createRoot, projects: nextProjects, projectCommands: Object.fromEntries(commands) });
+  }
+
   if (command === "delete") {
     const alias = normalizeProjectName(required(args, "name"));
     if (!alias) throw new Error("Project name must contain letters, numbers, underscore, or dash.");
@@ -262,5 +283,6 @@ function help() {
   project-manager list
   project-manager create --name <projectName> [--root <parentPath>]
   project-manager add --name <projectAlias> --path <existingFolder>
+  project-manager repoint --name <projectAlias> --path <existingFolder>
   project-manager delete --name <projectName> [--root <parentPath>]`);
 }

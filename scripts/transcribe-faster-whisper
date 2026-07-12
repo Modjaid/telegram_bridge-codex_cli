@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-exec /home/agent/codex-telegram-bridge/.venv/bin/python "$(dirname "$0")/transcribe-faster-whisper.py" "$@"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BRIDGE_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
+exec "$BRIDGE_DIR/.venv/bin/python" "$SCRIPT_DIR/transcribe-faster-whisper.py" "$@"
