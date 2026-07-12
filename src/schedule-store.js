@@ -272,10 +272,10 @@ function normalizeTask(task) {
   validateCron(cron);
   const timeZone = String(task.timeZone || "").trim();
   assertTimeZone(timeZone);
-  const rawWorkspace = String(task.workspace || "").trim();
-  if (!rawWorkspace) throw new Error("Task workspace is required");
-  const workspace = path.resolve(rawWorkspace);
-  if (workspace === path.parse(workspace).root) throw new Error("Task workspace is required");
+  const rawProject = String(task.project || "").trim();
+  if (!rawProject) throw new Error("Task project is required");
+  const project = path.resolve(rawProject);
+  if (project === path.parse(project).root) throw new Error("Task project is required");
   const prompt = String(task.prompt || "").trim();
   if (!prompt) throw new Error("Task prompt is required");
   const status = normalizeStatus(task.status ?? (task.enabled === false ? "disabled" : "enabled"));
@@ -287,7 +287,7 @@ function normalizeTask(task) {
     description: String(task.description || "").trim(),
     cron,
     timeZone,
-    workspace,
+    project,
     prompt,
     status,
     enabled,

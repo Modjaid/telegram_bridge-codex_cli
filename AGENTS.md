@@ -20,12 +20,12 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 ## Change Rules
 
 - Use existing no-dependency Node style; package requires Node `>=22`.
-- Workspaces are configured only in `.env`: `WORKSPACE_ALLOWLIST` is the comma-separated list of allowed absolute paths, and `WORKSPACE_COMMANDS` maps slash aliases to paths from that allowlist.
-- Telegram workspace create/delete must go through `scripts/workspace-manager`; do not hand-edit `.env` for that flow. Created workspaces must include an `AGENTS.md` file.
-- Telegram session key is global (`telegram`), so workspace switches/reset affect the whole Telegram bridge session.
-- Uploaded media goes under `<workspace>/Inbox`; update media metadata via `scripts/media-index`, not by hand-editing `.media-index.json`.
+- Projects are configured only in `.env`: `PROJECT_ALLOWLIST` is the comma-separated list of allowed absolute paths, and `PROJECT_COMMANDS` maps slash aliases to paths from that allowlist.
+- Telegram project create/delete must go through `scripts/project-manager`; do not hand-edit `.env` for that flow. Created projects must include an `AGENTS.md` file. Deleting a project recursively removes its folder and is restricted to paths inside `PROJECT_CREATE_ROOT`.
+- Telegram session key is global (`telegram`), so project switches/reset affect the whole Telegram bridge session.
+- Uploaded media goes under `<project>/Inbox`; update media metadata via `scripts/media-index`, not by hand-editing `.media-index.json`.
 - Telegram voice prompts reuse the STT progress message as the Codex live progress log to avoid extra `Transcribed` chat messages.
-- If behavior, config, workspace handling, service setup, or media flow changes, update this file in the same change.
+- If behavior, config, project handling, service setup, or media flow changes, update this file in the same change.
 
 ## Run/Check
 

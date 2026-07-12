@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
@@ -18,74 +18,76 @@ function main() {
   if (!command || command === "help" || command === "--help") return help();
 
   const env = readEnvFile(ENV_FILE);
-  const workspaces = csv(getEnv(env, "WORKSPACE_ALLOWLIST")).map(item => path.resolve(item));
-  const commands = buildWorkspaceCommands(getEnv(env, "WORKSPACE_COMMANDS"), workspaces);
-  const createRoot = path.resolve(args.root || getEnv(env, "WORKSPACE_CREATE_ROOT") || inferCreateRoot(workspaces));
+  const projects = csv(getEnv(env, "PROJECT_ALLOWLIST")).map(item => path.resolve(item));
+  const commands = buildProjectCommands(getEnv(env, "PROJECT_COMMANDS"), projects);
+  const createRoot = path.resolve(args.root || getEnv(env, "PROJECT_CREATE_ROOT") || inferCreateRoot(projects));
 
   if (command === "list") {
     return print({
       ok: true,
       createRoot,
-      workspaces,
-      workspaceCommands: Object.fromEntries(commands),
+      projects,
+      projectCommands: Object.fromEntries(commands),
     });
   }
 
   if (command === "create") {
     const inputName = required(args, "name");
-    const alias = normalizeWorkspaceName(inputName);
-    if (!alias) throw new Error("Workspace name must contain letters, numbers, underscore, or dash.");
-    if (commands.has(alias)) throw new Error(`Workspace command already exists: /${alias}`);
+    const alias = normalizeProjectName(inputName);
+    if (!alias) throw new Error("Project name must contain letters, numbers, underscore, or dash.");
+    if (commands.has(alias)) throw new Error(`Project command already exists: /${alias}`);
 
-    const workspace = path.resolve(createRoot, alias);
-    assertInside(createRoot, workspace);
-    if (workspaces.some(item => path.resolve(item) === workspace)) {
-      throw new Error(`Workspace is already allowed: ${workspace}`);
+    const project = path.resolve(createRoot, alias);
+    assertInside(createRoot, project);
+    if (projects.some(item => path.resolve(item) === project)) {
+      throw new Error(`Project is already allowed: ${project}`);
     }
 
-    mkdirSync(workspace, { recursive: true, mode: 0o700 });
-    const agentsPath = path.join(workspace, "AGENTS.md");
+    mkdirSync(project, { recursive: true, mode: 0o700 });
+    const agentsPath = path.join(project, "AGENTS.md");
     if (!existsSync(agentsPath)) {
       writeFileSync(agentsPath, defaultAgentsMd(alias), { mode: 0o600 });
     }
 
-    workspaces.push(workspace);
-    commands.set(alias, workspace);
-    writeWorkspaceEnv(env, workspaces, commands, createRoot);
+    projects.push(project);
+    commands.set(alias, project);
+    writeProjectEnv(env, projects, commands, createRoot);
     return print({
       ok: true,
       action: "created",
       alias,
-      workspace,
+      project,
       agentsPath,
       createRoot,
-      workspaces,
-      workspaceCommands: Object.fromEntries(commands),
+      projects,
+      projectCommands: Object.fromEntries(commands),
     });
   }
 
   if (command === "delete") {
-    const alias = normalizeWorkspaceName(required(args, "name"));
-    if (!alias) throw new Error("Workspace name must contain letters, numbers, underscore, or dash.");
-    const workspace = commands.get(alias);
-    if (!workspace) throw new Error(`Workspace command not found: /${alias}`);
+    const alias = normalizeProjectName(required(args, "name"));
+    if (!alias) throw new Error("Project name must contain letters, numbers, underscore, or dash.");
+    const project = commands.get(alias);
+    if (!project) throw new Error(`Project command not found: /${alias}`);
+    assertInside(createRoot, project);
 
-    for (const [commandAlias, commandWorkspace] of commands.entries()) {
-      if (path.resolve(commandWorkspace) === path.resolve(workspace)) commands.delete(commandAlias);
+    for (const [commandAlias, commandProject] of commands.entries()) {
+      if (path.resolve(commandProject) === path.resolve(project)) commands.delete(commandAlias);
     }
-    const remainingWorkspaces = workspaces.filter(item => path.resolve(item) !== path.resolve(workspace));
-    if (remainingWorkspaces.length === 0) throw new Error("Cannot delete the last allowed workspace.");
-    writeWorkspaceEnv(env, remainingWorkspaces, commands, createRoot);
+    const remainingProjects = projects.filter(item => path.resolve(item) !== path.resolve(project));
+    if (remainingProjects.length === 0) throw new Error("Cannot delete the last allowed project.");
+    rmSync(project, { recursive: true, force: true });
+    writeProjectEnv(env, remainingProjects, commands, createRoot);
     return print({
       ok: true,
       action: "deleted",
       alias,
-      workspace,
-      removedFromAllowlist: remainingWorkspaces.length !== workspaces.length,
-      folderRemoved: false,
+      project,
+      removedFromAllowlist: remainingProjects.length !== projects.length,
+      folderRemoved: true,
       createRoot,
-      workspaces: remainingWorkspaces,
-      workspaceCommands: Object.fromEntries(commands),
+      projects: remainingProjects,
+      projectCommands: Object.fromEntries(commands),
     });
   }
 
@@ -119,11 +121,11 @@ function getEnv(lines, key) {
   return "";
 }
 
-function writeWorkspaceEnv(lines, workspaces, commands, createRoot) {
+function writeProjectEnv(lines, projects, commands, createRoot) {
   const values = {
-    WORKSPACE_ALLOWLIST: unique(workspaces.map(item => path.resolve(item))).join(","),
-    WORKSPACE_COMMANDS: [...commands.entries()].map(([alias, workspace]) => `${alias}=${path.resolve(workspace)}`).join(","),
-    WORKSPACE_CREATE_ROOT: path.resolve(createRoot),
+    PROJECT_ALLOWLIST: unique(projects.map(item => path.resolve(item))).join(","),
+    PROJECT_COMMANDS: [...commands.entries()].map(([alias, project]) => `${alias}=${path.resolve(project)}`).join(","),
+    PROJECT_CREATE_ROOT: path.resolve(createRoot),
   };
 
   const seen = new Set();
@@ -144,35 +146,35 @@ function writeWorkspaceEnv(lines, workspaces, commands, createRoot) {
   renameSync(temp, ENV_FILE);
 }
 
-function buildWorkspaceCommands(spec, workspaces) {
+function buildProjectCommands(spec, projects) {
   const commands = new Map();
-  for (const workspace of workspaces) {
-    addWorkspaceAlias(commands, path.basename(workspace), workspace);
+  for (const project of projects) {
+    addProjectAlias(commands, path.basename(project), project);
   }
-  if (workspaces.includes("/home/agent")) addWorkspaceAlias(commands, "agent", "/home/agent");
+  if (projects.includes("/home/agent")) addProjectAlias(commands, "agent", "/home/agent");
 
   for (const item of csv(spec)) {
     const match = item.match(/^\/?([A-Za-z0-9_]+)=(.+)$/);
-    if (!match) throw new Error(`Invalid WORKSPACE_COMMANDS entry: ${item}`);
-    addWorkspaceAlias(commands, match[1], path.resolve(match[2].trim()));
+    if (!match) throw new Error(`Invalid PROJECT_COMMANDS entry: ${item}`);
+    addProjectAlias(commands, match[1], path.resolve(match[2].trim()));
   }
   return commands;
 }
 
-function addWorkspaceAlias(commands, alias, workspace) {
+function addProjectAlias(commands, alias, project) {
   const normalized = String(alias || "").trim().toLowerCase();
   if (!normalized || !/^[a-z0-9_]+$/.test(normalized)) return;
-  commands.set(normalized, path.resolve(workspace));
+  commands.set(normalized, path.resolve(project));
 }
 
-function normalizeWorkspaceName(value) {
+function normalizeProjectName(value) {
   const normalized = String(value || "").trim().toLowerCase().replace(/-/g, "_");
   return /^[a-z0-9_]+$/.test(normalized) ? normalized : "";
 }
 
-function inferCreateRoot(workspaces) {
-  if (!workspaces.length) return process.cwd();
-  const first = path.resolve(workspaces[0]);
+function inferCreateRoot(projects) {
+  if (!projects.length) return process.cwd();
+  const first = path.resolve(projects[0]);
   if (process.env.HOME && first === path.resolve(process.env.HOME)) return first;
   return path.dirname(first);
 }
@@ -180,7 +182,7 @@ function inferCreateRoot(workspaces) {
 function assertInside(root, target) {
   const relative = path.relative(root, target);
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error(`Workspace path must be inside create root: ${root}`);
+    throw new Error(`Project path must be inside create root: ${root}`);
   }
 }
 
@@ -188,12 +190,12 @@ function defaultAgentsMd(alias) {
   return [
     `# AGENTS.md instructions for /${alias}`,
     "",
-    "This workspace was created by the Codex Telegram Bridge.",
+    "This project was created by the Codex Telegram Bridge.",
     "",
     "## Notes",
     "",
     "- Keep project-specific instructions here.",
-    "- Update this file when workspace behavior or conventions change.",
+    "- Update this file when project behavior or conventions change.",
     "",
   ].join("\n");
 }
@@ -222,7 +224,7 @@ function print(value) {
 
 function help() {
   console.log(`Usage:
-  workspace-manager list
-  workspace-manager create --name <workspaceName> [--root <parentPath>]
-  workspace-manager delete --name <workspaceName> [--root <parentPath>]`);
+  project-manager list
+  project-manager create --name <projectName> [--root <parentPath>]
+  project-manager delete --name <projectName> [--root <parentPath>]`);
 }

@@ -8,7 +8,7 @@ import {
   addTelegramMessageAlias,
   createTelegramMediaRecord,
   deleteMediaItem,
-  findMediaWorkspace,
+  findMediaProject,
   getMediaItem,
   MEDIA_INDEX_RELATIVE_PATH,
   peekMediaByTelegramMessage,
@@ -32,7 +32,7 @@ import {
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const STATE_DIR = path.join(ROOT, "state");
 const STATE_FILE = path.join(STATE_DIR, "state.json");
-const SCHEDULE_WORKSPACE = ROOT;
+const SCHEDULE_PROJECT = ROOT;
 
 loadDotEnv(path.join(ROOT, ".env"));
 
@@ -40,8 +40,8 @@ const config = {
   telegramEnabled: parseBool(process.env.TELEGRAM_ADAPTER_ENABLED || (process.env.BOT_TOKEN ? "true" : "false")),
   botToken: process.env.BOT_TOKEN || "",
   allowedUserIds: csv(process.env.ALLOWED_USER_IDS).map(Number).filter(Boolean),
-  workspaces: csv(process.env.WORKSPACE_ALLOWLIST).map(p => path.resolve(p)),
-  workspaceCommandSpec: process.env.WORKSPACE_COMMANDS || "",
+  projects: csv(process.env.PROJECT_ALLOWLIST).map(p => path.resolve(p)),
+  projectCommandSpec: process.env.PROJECT_COMMANDS || "",
   codexBin: process.env.CODEX_BIN || "codex",
   defaultModel: process.env.CODEX_MODEL || "",
   defaultSandbox: process.env.CODEX_SANDBOX || "workspace-write",
@@ -74,19 +74,19 @@ if (config.telegramEnabled && !config.botToken) {
 if (config.telegramEnabled && config.allowedUserIds.length === 0) {
   throw new Error("ALLOWED_USER_IDS must contain at least one numeric Telegram user id");
 }
-if (config.workspaces.length === 0) {
-  throw new Error("WORKSPACE_ALLOWLIST must contain at least one absolute workspace path");
+if (config.projects.length === 0) {
+  throw new Error("PROJECT_ALLOWLIST must contain at least one absolute project path");
 }
-for (const workspace of config.workspaces) {
-  if (!existsSync(workspace)) throw new Error(`Workspace does not exist: ${workspace}`);
+for (const project of config.projects) {
+  if (!existsSync(project)) throw new Error(`Project does not exist: ${project}`);
 }
-config.workspaceCommands = parseWorkspaceCommandSpec(config.workspaceCommandSpec, config.workspaces);
-config.workspaceCreateRoot = path.resolve(process.env.WORKSPACE_CREATE_ROOT || inferWorkspaceCreateRoot(config.workspaces));
+config.projectCommands = parseProjectCommandSpec(config.projectCommandSpec, config.projects);
+config.projectCreateRoot = path.resolve(process.env.PROJECT_CREATE_ROOT || inferProjectCreateRoot(config.projects));
 
 const apiBase = config.botToken ? `https://api.telegram.org/bot${config.botToken}` : "";
 const state = loadState();
 const running = new Map();
-const runningWorkspaces = new Map();
+const runningProjects = new Map();
 const liveProgressMessages = new Map();
 let offset = Number(state.offset || 0);
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"];
@@ -99,8 +99,8 @@ const SCHEDULE_SESSION_ALIAS = "schedule";
 console.log("Codex Bridge started");
 console.log(`Telegram adapter: ${config.telegramEnabled ? "enabled" : "disabled"}`);
 if (config.telegramEnabled) console.log(`Allowed Telegram users: ${config.allowedUserIds.join(", ")}`);
-console.log(`Default workspace: ${config.workspaces[0]}`);
-console.log(`Workspace commands: ${formatWorkspaceCommands(config.workspaceCommands) || "none"}`);
+console.log(`Default project: ${config.projects[0]}`);
+console.log(`Project commands: ${formatProjectCommands(config.projectCommands) || "none"}`);
 console.log(`Bridge commands: ${config.bridgeCommands.join(", ")}`);
 if (config.telegramEnabled) startScheduleRunner();
 if (config.collabmdEnabled) startCollabmdHttpAdapter();
@@ -132,7 +132,7 @@ async function runTelegramAdapter() {
 
 async function syncTelegramCommandMenu() {
   const commands = [
-    { command: "commands", description: "List workspace commands" },
+    { command: "projects", description: "List and switch projects" },
     { command: "schedule", description: "Manage scheduled Codex tasks" },
   ];
   const scopes = [
@@ -160,7 +160,7 @@ async function syncTelegramCommandMenu() {
     }
   }
 
-  console.log("Telegram command menu synced: /commands, /schedule");
+  console.log("Telegram command menu synced: /projects, /schedule");
 }
 
 async function handleUpdate(update) {
@@ -186,11 +186,11 @@ async function handleCallback(query) {
     return;
   }
 
-  if (data === "workspace:create") {
-    await answerCallback(query.id, "Workspace name requested");
-    const root = config.workspaceCreateRoot;
+  if (data === "project:create") {
+    await answerCallback(query.id, "Project name requested");
+    const root = config.projectCreateRoot;
     const prompt = [
-      "Введите имя нового workspace.",
+      "Введите имя нового project.",
       "",
       `Папка будет создана внутри:\n${root}`,
       "",
@@ -199,7 +199,13 @@ async function handleCallback(query) {
       "Разрешены латинские буквы, цифры, подчёркивание и дефис.",
     ].join("\n");
     const requestMessage = await sendMessage(chatId, prompt, telegramReplyExtra(query.message?.message_id));
-    rememberPendingWorkspaceCreate(chatId, requestMessage.message_id);
+    rememberPendingProjectCreate(chatId, requestMessage.message_id);
+    return;
+  }
+
+  if (data === "project:list") {
+    await answerCallback(query.id, "Projects");
+    await editBridgeMessage(target, query.message.message_id, projectCommandsText(), projectCommandsKeyboard());
     return;
   }
 
@@ -229,17 +235,17 @@ async function handleCallback(query) {
     return;
   }
 
-  if (data.startsWith("repo:")) {
-    const index = Number(data.slice("repo:".length));
-    if (Number.isInteger(index) && config.workspaces[index]) {
-      const workdir = config.workspaces[index];
-      const alias = workspaceAliasForPath(workdir);
-      const newTarget = createTelegramWorkspaceSession(chatId, { alias, workdir, prompt: "" });
+  if (data.startsWith("project:select:")) {
+    const index = Number(data.slice("project:select:".length));
+    if (Number.isInteger(index) && config.projects[index]) {
+      const workdir = config.projects[index];
+      const alias = projectAliasForPath(workdir);
+      const newTarget = createTelegramProjectSession(chatId, { alias, workdir, prompt: "" });
       saveState();
-      await answerCallback(query.id, "Workspace session started");
-      await editBridgeMessage(newTarget, query.message.message_id, `Workspace session started:\n${workdir}`, statusKeyboard());
+      await answerCallback(query.id, "Project session started");
+      await editBridgeMessage(newTarget, query.message.message_id, `Project session started:\n${workdir}`, statusKeyboard());
     } else {
-      await answerCallback(query.id, "Unknown workspace");
+      await answerCallback(query.id, "Unknown project");
     }
     return;
   }
@@ -298,8 +304,8 @@ async function handleMediaCallback(query, data) {
   }
 
   try {
-    const found = findMediaWorkspace(config.workspaces, mediaId);
-    console.log(`media callback lookup: action=${action || ""} mediaId=${mediaId} found=${found ? "yes" : "no"} workspace=${found?.workspace || ""}`);
+    const found = findMediaProject(config.projects, mediaId);
+    console.log(`media callback lookup: action=${action || ""} mediaId=${mediaId} found=${found ? "yes" : "no"} project=${found?.project || ""}`);
     if (action === "info") {
       if (!found) {
         console.log(`media info not found: mediaId=${mediaId}`);
@@ -308,8 +314,8 @@ async function handleMediaCallback(query, data) {
         return;
       }
       await answerCallback(query.id, "Info");
-      await editMediaCallbackMessage(query.message, formatMediaInfo(found.workspace, found.item), mediaKeyboard(mediaId));
-      console.log(`media info shown: mediaId=${mediaId} workspace=${found.workspace}`);
+      await editMediaCallbackMessage(query.message, formatMediaInfo(found.project, found.item), mediaKeyboard(mediaId));
+      console.log(`media info shown: mediaId=${mediaId} project=${found.project}`);
       return;
     }
 
@@ -320,14 +326,14 @@ async function handleMediaCallback(query, data) {
         await editMediaCallbackMessage(query.message, `File already removed from storage:\n${mediaId}`, undefined);
         return;
       }
-      const result = deleteMediaItem(found.workspace, mediaId);
-      console.log(`media delete result: mediaId=${mediaId} workspace=${found.workspace} deleted=${result.deleted} fileDeleted=${result.fileDeleted} file=${result.filePath || ""}`);
+      const result = deleteMediaItem(found.project, mediaId);
+      console.log(`media delete result: mediaId=${mediaId} project=${found.project} deleted=${result.deleted} fileDeleted=${result.fileDeleted} file=${result.filePath || ""}`);
       await answerCallback(query.id, result.deleted ? "Deleted" : "Already removed");
       await editMediaCallbackMessage(query.message, [
         "File deleted from storage.",
         `mediaId: ${mediaId}`,
         result.filePath ? `file: ${result.filePath}` : "",
-        `workspace: ${found.workspace}`,
+        `project: ${found.project}`,
       ].filter(Boolean).join("\n"), undefined);
       return;
     }
@@ -360,11 +366,11 @@ async function handleMessage(message) {
   const inboxAttachment = voicePrompt ? null : getInboxAttachment(message);
   if (!text && !audio && !jsonDocument && !inboxAttachment) return;
 
-  if (text && await handlePendingWorkspaceCreateReply(message, text)) return;
+  if (text && await handlePendingProjectCreateReply(message, text)) return;
 
-  const workspaceDeleteCommand = parseWorkspaceDeleteCommand(text);
-  if (workspaceDeleteCommand) {
-    await handleWorkspaceDeleteCommand(chatId, workspaceDeleteCommand, message.message_id);
+  const projectDeleteCommand = parseProjectDeleteCommand(text);
+  if (projectDeleteCommand) {
+    await handleProjectDeleteCommand(chatId, projectDeleteCommand, message.message_id);
     return;
   }
 
@@ -378,11 +384,11 @@ async function handleMessage(message) {
     bindTelegramMessageToSession(telegramTarget(chatId, getActiveTelegramSessionKey(chatId)), message.message_id);
   }
 
-  const workspaceCommand = parseWorkspaceCommand(text);
+  const projectCommand = parseProjectCommand(text);
   let target = null;
   let session = null;
-  if (workspaceCommand) {
-    target = createTelegramWorkspaceSession(chatId, workspaceCommand);
+  if (projectCommand) {
+    target = createTelegramProjectSession(chatId, projectCommand);
     session = getSession(target.key);
     bindTelegramMessageToSession(target, message.message_id);
   } else {
@@ -403,7 +409,7 @@ async function handleMessage(message) {
     if (await handleGlobalCommandWithoutSession(chatId, text, message.message_id)) return;
     await sendMessage(
       chatId,
-      `No active workspace session. Start one with a workspace command, for example:\n${firstWorkspaceCommandExample()}`,
+      `No active project session. Start one with a project command, for example:\n${firstProjectCommandExample()}`,
       telegramReplyExtra(message.message_id),
     );
     return;
@@ -494,8 +500,8 @@ async function handleMessage(message) {
     return;
   }
 
-  if (workspaceCommand) {
-    await handleWorkspaceCommand(target, session, workspaceCommand);
+  if (projectCommand) {
+    await handleProjectCommand(target, session, projectCommand);
     return;
   }
 
@@ -552,11 +558,8 @@ async function handleCommand(target, text) {
       await sendBridgeMessage(target, "Pending answer mode cleared.");
       return;
     }
-    case "/repo":
-      await sendBridgeMessage(target, "Choose workspace:", { reply_markup: repoKeyboard() });
-      return;
-    case "/commands":
-      await sendBridgeMessage(target, workspaceCommandsText(), { reply_markup: workspaceCommandsKeyboard() });
+    case "/projects":
+      await sendBridgeMessage(target, projectCommandsText(), { reply_markup: projectCommandsKeyboard() });
       return;
     case "/model": {
       const session = getSession(target.key);
@@ -612,17 +615,14 @@ async function handleGlobalCommandWithoutSession(chatId, text, replyToMessageId 
     case "/help":
       await sendMessage(chatId, helpText(), replyExtra);
       return true;
-    case "/commands":
-      await sendMessage(chatId, workspaceCommandsText(), { ...replyExtra, reply_markup: workspaceCommandsKeyboard() });
-      return true;
-    case "/repo":
-      await sendMessage(chatId, "Choose workspace:", { ...replyExtra, reply_markup: repoKeyboard() });
+    case "/projects":
+      await sendMessage(chatId, projectCommandsText(), { ...replyExtra, reply_markup: projectCommandsKeyboard() });
       return true;
     case "/schedule":
       await handleScheduleCommandMessage({ chat: { id: chatId }, message_id: replyToMessageId, text }, { action: "open", rest: String(text || "").replace(/^\/schedule(?:@[A-Za-z0-9_]+)?/i, "").trim() });
       return true;
     case "/status":
-      await sendMessage(chatId, "No active workspace session.", replyExtra);
+      await sendMessage(chatId, "No active project session.", replyExtra);
       return true;
     default:
       return false;
@@ -631,9 +631,9 @@ async function handleGlobalCommandWithoutSession(chatId, text, replyToMessageId 
 
 async function handleScheduleCommandMessage(message, scheduleCommand) {
   const chatId = message.chat.id;
-  const currentWorkspace = currentTelegramWorkspace(chatId);
+  const currentProject = currentTelegramProject(chatId);
   const target = createTelegramScheduleSession(chatId, {
-    currentWorkspace,
+    currentProject,
     action: scheduleCommand.action,
     taskRef: scheduleCommand.taskRef || "",
   });
@@ -644,7 +644,7 @@ async function handleScheduleCommandMessage(message, scheduleCommand) {
   }
 
   if (scheduleCommand.action === "open" && !scheduleCommand.rest) {
-    await sendBridgeMessage(target, formatScheduleTaskList(chatId, currentWorkspace));
+    await sendBridgeMessage(target, formatScheduleTaskList(chatId, currentProject));
     return;
   }
 
@@ -681,10 +681,10 @@ function createTelegramScheduleSession(chatId, options = {}) {
     key,
     adapter: "telegram",
     chatId: String(chatId),
-    workdir: SCHEDULE_WORKSPACE,
-    workspaceCommand: SCHEDULE_SESSION_ALIAS,
+    workdir: SCHEDULE_PROJECT,
+    projectCommand: SCHEDULE_SESSION_ALIAS,
     scheduleMode: true,
-    scheduleCurrentWorkspace: options.currentWorkspace || config.workspaces[0],
+    scheduleCurrentProject: options.currentProject || config.projects[0],
     scheduleAction: options.action || "open",
     scheduleTaskRef: options.taskRef || "",
     sandbox: config.defaultSandbox,
@@ -699,11 +699,11 @@ function createTelegramScheduleSession(chatId, options = {}) {
   return telegramTarget(chatId, key);
 }
 
-function currentTelegramWorkspace(chatId) {
+function currentTelegramProject(chatId) {
   const activeKey = getActiveTelegramSessionKey(chatId);
   const session = activeKey ? getSession(activeKey) : null;
-  const workdir = session?.scheduleMode ? session.scheduleCurrentWorkspace : session?.workdir;
-  return path.resolve(workdir || config.workspaces[0]);
+  const workdir = session?.scheduleMode ? session.scheduleCurrentProject : session?.workdir;
+  return path.resolve(workdir || config.projects[0]);
 }
 
 function rememberPendingScheduleSession(chatId, sessionKey, taskId) {
@@ -743,102 +743,102 @@ function clearPendingScheduleSession(chatId) {
   saveState();
 }
 
-function rememberPendingWorkspaceCreate(chatId, messageId) {
+function rememberPendingProjectCreate(chatId, messageId) {
   state.telegramChats ||= {};
   const key = String(chatId);
   state.telegramChats[key] ||= {};
-  state.telegramChats[key].pendingWorkspaceCreateMessageId = String(messageId || "");
-  state.telegramChats[key].pendingWorkspaceCreateRoot = config.workspaceCreateRoot;
-  state.telegramChats[key].pendingWorkspaceCreateExpiresAt = new Date(Date.now() + 10 * 60000).toISOString();
+  state.telegramChats[key].pendingProjectCreateMessageId = String(messageId || "");
+  state.telegramChats[key].pendingProjectCreateRoot = config.projectCreateRoot;
+  state.telegramChats[key].pendingProjectCreateExpiresAt = new Date(Date.now() + 10 * 60000).toISOString();
   saveState();
 }
 
-function clearPendingWorkspaceCreate(chatId) {
+function clearPendingProjectCreate(chatId) {
   const chat = state.telegramChats?.[String(chatId)];
   if (!chat) return;
-  delete chat.pendingWorkspaceCreateMessageId;
-  delete chat.pendingWorkspaceCreateRoot;
-  delete chat.pendingWorkspaceCreateExpiresAt;
+  delete chat.pendingProjectCreateMessageId;
+  delete chat.pendingProjectCreateRoot;
+  delete chat.pendingProjectCreateExpiresAt;
   saveState();
 }
 
-function pendingWorkspaceCreateForReply(chatId, replyMessageId) {
+function pendingProjectCreateForReply(chatId, replyMessageId) {
   const chat = state.telegramChats?.[String(chatId)];
-  if (!chat?.pendingWorkspaceCreateMessageId) return null;
-  if (chat.pendingWorkspaceCreateExpiresAt && Date.parse(chat.pendingWorkspaceCreateExpiresAt) < Date.now()) {
-    clearPendingWorkspaceCreate(chatId);
+  if (!chat?.pendingProjectCreateMessageId) return null;
+  if (chat.pendingProjectCreateExpiresAt && Date.parse(chat.pendingProjectCreateExpiresAt) < Date.now()) {
+    clearPendingProjectCreate(chatId);
     return null;
   }
-  if (String(replyMessageId || "") !== String(chat.pendingWorkspaceCreateMessageId)) return null;
+  if (String(replyMessageId || "") !== String(chat.pendingProjectCreateMessageId)) return null;
   return {
-    messageId: chat.pendingWorkspaceCreateMessageId,
-    root: chat.pendingWorkspaceCreateRoot || config.workspaceCreateRoot,
+    messageId: chat.pendingProjectCreateMessageId,
+    root: chat.pendingProjectCreateRoot || config.projectCreateRoot,
   };
 }
 
-async function handlePendingWorkspaceCreateReply(message, text) {
+async function handlePendingProjectCreateReply(message, text) {
   const chatId = message.chat.id;
-  const pending = pendingWorkspaceCreateForReply(chatId, message.reply_to_message?.message_id);
+  const pending = pendingProjectCreateForReply(chatId, message.reply_to_message?.message_id);
   if (!pending) return false;
 
-  clearPendingWorkspaceCreate(chatId);
+  clearPendingProjectCreate(chatId);
   const name = text.trim().split(/\s+/)[0] || "";
   try {
-    const result = await runWorkspaceManager("create", ["--name", name, "--root", pending.root]);
-    applyWorkspaceManagerResult(result);
-    const target = createTelegramWorkspaceSession(chatId, {
+    const result = await runProjectManager("create", ["--name", name, "--root", pending.root]);
+    applyProjectManagerResult(result);
+    const target = createTelegramProjectSession(chatId, {
       alias: result.alias,
-      workdir: result.workspace,
+      workdir: result.project,
       prompt: "",
     });
     bindTelegramMessageToSession(target, message.message_id);
     await sendBridgeMessage(target, [
-      "Workspace created.",
+      "Project created.",
       `Command: /${result.alias}`,
-      `Path: ${result.workspace}`,
+      `Path: ${result.project}`,
       `Instructions: ${result.agentsPath}`,
     ].join("\n"));
   } catch (error) {
-    await sendMessage(chatId, `Workspace create failed: ${error.message}`, telegramReplyExtra(message.message_id));
+    await sendMessage(chatId, `Project create failed: ${error.message}`, telegramReplyExtra(message.message_id));
   }
   return true;
 }
 
-async function handleWorkspaceDeleteCommand(chatId, workspaceDeleteCommand, replyToMessageId = "") {
+async function handleProjectDeleteCommand(chatId, projectDeleteCommand, replyToMessageId = "") {
   try {
-    const result = await runWorkspaceManager("delete", ["--name", workspaceDeleteCommand.alias, "--root", config.workspaceCreateRoot]);
-    applyWorkspaceManagerResult(result);
+    const result = await runProjectManager("delete", ["--name", projectDeleteCommand.alias, "--root", config.projectCreateRoot]);
+    applyProjectManagerResult(result);
     const activeKey = getActiveTelegramSessionKey(chatId);
     const activeSession = activeKey ? getSession(activeKey) : null;
-    if (activeSession && path.resolve(activeSession.workdir || "") === path.resolve(result.workspace || "")) {
-      const fallback = config.workspaces[0] || "";
+    if (activeSession && path.resolve(activeSession.workdir || "") === path.resolve(result.project || "")) {
+      const fallback = config.projects[0] || "";
       if (fallback) {
         activeSession.workdir = fallback;
-        activeSession.workspaceCommand = workspaceAliasForPath(fallback);
+        activeSession.projectCommand = projectAliasForPath(fallback);
         delete activeSession.threadId;
         delete activeSession.pendingAnswer;
       }
       saveState();
     }
     await sendMessage(chatId, [
-      `Workspace command deleted: /${result.alias}`,
-      `Removed from allowlist: ${result.workspace}`,
-      "Folder was not removed from disk.",
+      `Project command deleted: /${result.alias}`,
+      `Removed from allowlist: ${result.project}`,
+      `Folder removed from disk: ${result.folderRemoved ? "yes" : "no"}`,
     ].join("\n"), telegramReplyExtra(replyToMessageId));
   } catch (error) {
-    await sendMessage(chatId, `Workspace delete failed: ${error.message}`, telegramReplyExtra(replyToMessageId));
+    await sendMessage(chatId, `Project delete failed: ${error.message}`, telegramReplyExtra(replyToMessageId));
   }
 }
 
-function formatScheduleTaskList(chatId, currentWorkspace) {
-  const workspace = path.resolve(currentWorkspace || config.workspaces[0]);
-  const tasks = listScheduleTasks(ROOT, chatId).filter(task => path.resolve(task.workspace) === workspace);
+function formatScheduleTaskList(chatId, currentProject) {
+  const project = path.resolve(currentProject || config.projects[0]);
+  const tasks = listScheduleTasks(ROOT, chatId).filter(task => path.resolve(task.project) === project);
   const now = new Date();
-  const header = `Schedule: /${workspaceAliasForPath(workspace)}`;
+  const header = `Schedule: /${projectAliasForPath(project)}`;
   if (!tasks.length) {
     return [
       header,
-      "Нет задач для этого workspace.",
+      "Нет задач для этого project.",
     ].join("\n");
   }
   return [
@@ -867,7 +867,7 @@ function formatScheduleTaskDetails(task, now = new Date()) {
     `name: ${task.name}`,
     `description: ${task.description || ""}`,
     `status: ${task.status || (task.enabled ? "enabled" : "disabled")}`,
-    `workspace: ${task.workspace}`,
+    `project: ${task.project}`,
     `schedule: ${task.cron}`,
     `time zone: ${task.timeZone}`,
     `human schedule: ${formatHumanSchedule(task, now)}`,
@@ -938,7 +938,7 @@ function buildSchedulePrompt(session, userText, command = {}) {
   const systemTimeZone = getSystemTimeZone();
   const now = new Date();
   const selectedTask = command.taskRef || session.scheduleTaskRef ? getScheduleTask(ROOT, chatId, command.taskRef || session.scheduleTaskRef) : null;
-  const currentWorkspace = path.resolve(session.scheduleCurrentWorkspace || config.workspaces[0]);
+  const currentProject = path.resolve(session.scheduleCurrentProject || config.projects[0]);
   return [
     "You are in Telegram Bridge /schedule mode. Help the user create, edit, or delete persistent Codex cron tasks through dialog.",
     "",
@@ -953,16 +953,16 @@ function buildSchedulePrompt(session, userText, command = {}) {
     "- For relative schedule edits, interpret `forward`, `later`, `вперёд`, `позже`, and `через` as moving the run later. For example, `на две минуты вперёд` means add 2 minutes to the selected task's cron time. Use `schedule-task patch` immediately when the edit is clear.",
     "- If the user's time zone is unknown, ask for it before saving the first task. Save it with `schedule-task set-timezone --chat-id ... --timezone ...` once known.",
     "- Use IANA time zones such as Europe/Berlin or America/New_York.",
-    "- Bind new tasks to the current Telegram workspace shown below unless the user explicitly chooses another allowed workspace.",
-    "- The prompt saved for a task must be the exact instruction that a future Codex CLI run should execute in that task workspace.",
+    "- Bind new tasks to the current Telegram project shown below unless the user explicitly chooses another allowed project.",
+    "- The prompt saved for a task must be the exact instruction that a future Codex CLI run should execute in that task project.",
     "- Use a 5-field cron expression. Convert natural language schedules into cron in the user's time zone.",
     "- Task names must be 1-48 chars and use only A-Z, a-z, 0-9, underscore.",
     "- Use status enabled or disabled.",
     "",
     "Bridge/runtime context:",
     `- chat_id: ${chatId}`,
-    `- current Telegram workspace for new tasks: ${currentWorkspace}`,
-    `- allowed workspaces: ${config.workspaces.join(", ")}`,
+    `- current Telegram project for new tasks: ${currentProject}`,
+    `- allowed projects: ${config.projects.join(", ")}`,
     `- user time zone: ${user.timeZone || "unknown"}`,
     `- bridge system time zone: ${systemTimeZone}`,
     user.timeZone ? `- current user/system offset difference: ${formatOffsetDifference(user.timeZone, systemTimeZone, now)}` : "- current user/system offset difference: unknown until user time zone is set",
@@ -977,8 +977,8 @@ function buildSchedulePrompt(session, userText, command = {}) {
     `- schedule-task list --chat-id ${chatId} --json`,
     `- schedule-task show --chat-id ${chatId} --name <task name or id>`,
     `- schedule-task set-timezone --chat-id ${chatId} --timezone <IANA zone>`,
-    `- schedule-task upsert --chat-id ${chatId} --name <name> --title <title> --description <text> --cron "0 9 * * *" --timezone <IANA zone> --workspace <absolute path> --prompt <prompt> --status enabled`,
-    `- schedule-task patch --chat-id ${chatId} --name <task name or id> [--new-name <name>] [--title <title>] [--description <text>] [--cron "0 9 * * *"] [--timezone <IANA zone>] [--workspace <absolute path>] [--prompt <prompt>] [--status enabled|disabled]`,
+    `- schedule-task upsert --chat-id ${chatId} --name <name> --title <title> --description <text> --cron "0 9 * * *" --timezone <IANA zone> --project <absolute path> --prompt <prompt> --status enabled`,
+    `- schedule-task patch --chat-id ${chatId} --name <task name or id> [--new-name <name>] [--title <title>] [--description <text>] [--cron "0 9 * * *"] [--timezone <IANA zone>] [--project <absolute path>] [--prompt <prompt>] [--status enabled|disabled]`,
     `- schedule-task enable --chat-id ${chatId} --name <task name or id>`,
     `- schedule-task disable --chat-id ${chatId} --name <task name or id>`,
     `- schedule-task rename --chat-id ${chatId} --name <task name or id> --new-name <name> [--title <title>]`,
@@ -1012,17 +1012,17 @@ async function runDueScheduleTasks(now = new Date()) {
       if (!matchesCronAt(task.cron, now, task.timeZone)) continue;
       const runKey = scheduleRunKey(now, task.timeZone);
       if (task.lastRunKey === runKey) continue;
-      if (!isAllowedWorkspace(task.workspace)) {
-        console.warn(`Skipping schedule task ${task.id || task.name}: workspace is not allowed: ${task.workspace}`);
+      if (!isAllowedProject(task.project)) {
+        console.warn(`Skipping schedule task ${task.id || task.name}: project is not allowed: ${task.project}`);
         refreshScheduleTaskNextRun(ROOT, user.chatId, task.id || task.name, now);
         continue;
       }
-      const workspaceKey = path.resolve(task.workspace);
-      if (runningWorkspaces.has(workspaceKey)) continue;
+      const projectKey = path.resolve(task.project);
+      if (runningProjects.has(projectKey)) continue;
       const target = createTelegramScheduledTaskSession(user.chatId, task);
       markScheduleTaskRun(ROOT, user.chatId, task.id || task.name, runKey, now.toISOString());
       await runCodex(target, buildScheduledTaskPrompt(task, now), {
-        liveHeader: `Scheduled task: ${task.title || task.name}\nWorkspace: ${task.workspace}`,
+        liveHeader: `Scheduled task: ${task.title || task.name}\nProject: ${task.project}`,
       });
     }
   }
@@ -1038,8 +1038,8 @@ function createTelegramScheduledTaskSession(chatId, task) {
     key,
     adapter: "telegram",
     chatId: String(chatId),
-    workdir: task.workspace,
-    workspaceCommand: workspaceAliasForPath(task.workspace),
+    workdir: task.project,
+    projectCommand: projectAliasForPath(task.project),
     scheduledTaskId: task.id || "",
     scheduledTaskName: task.name || "",
     sandbox: config.defaultSandbox,
@@ -1062,22 +1062,22 @@ function buildScheduledTaskPrompt(task, now) {
     task.description ? `Description: ${task.description}` : "",
     `Schedule: ${task.cron} (${task.timeZone})`,
     `Scheduled instant: ${now.toISOString()}`,
-    `Workspace: ${task.workspace}`,
+    `Project: ${task.project}`,
     "",
-    "Execute the saved task instruction in this workspace. Report the result concisely to Telegram.",
+    "Execute the saved task instruction in this project. Report the result concisely to Telegram.",
     "",
     "Saved task instruction:",
     task.prompt,
   ].filter(Boolean).join("\n");
 }
 
-function isAllowedWorkspace(workspace) {
-  const resolved = path.resolve(workspace || "");
-  return config.workspaces.some(allowed => path.resolve(allowed) === resolved);
+function isAllowedProject(project) {
+  const resolved = path.resolve(project || "");
+  return config.projects.some(allowed => path.resolve(allowed) === resolved);
 }
 
-function inferWorkspaceCreateRoot(workspaces) {
-  const first = path.resolve(workspaces[0] || ROOT);
+function inferProjectCreateRoot(projects) {
+  const first = path.resolve(projects[0] || ROOT);
   if (process.env.HOME && first === path.resolve(process.env.HOME)) return first;
   return path.dirname(first);
 }
@@ -1098,18 +1098,18 @@ function formatOffsetDifference(userTimeZone, systemTimeZone, date = new Date())
   return `user is ${sign}${hours}:${String(minutes).padStart(2, "0")} relative to bridge system time`;
 }
 
-async function handleWorkspaceCommand(target, session, workspaceCommand) {
-  session.workdir = workspaceCommand.workdir;
-  session.workspaceCommand = workspaceCommand.alias;
+async function handleProjectCommand(target, session, projectCommand) {
+  session.workdir = projectCommand.workdir;
+  session.projectCommand = projectCommand.alias;
   session.lastUserActivityAt = new Date().toISOString();
   saveState();
 
-  if (!workspaceCommand.prompt) {
-    await sendBridgeMessage(target, `Workspace session started:\n${workspaceCommand.workdir}`);
+  if (!projectCommand.prompt) {
+    await sendBridgeMessage(target, `Project session started:\n${projectCommand.workdir}`);
     return;
   }
 
-  await runCodex(target, workspaceCommand.prompt);
+  await runCodex(target, projectCommand.prompt);
 }
 
 async function runCodex(target, prompt, options = {}) {
@@ -1128,12 +1128,12 @@ async function runCodex(target, prompt, options = {}) {
   }
 
   const session = getSession(target.key);
-  const workdir = session.workdir || config.workspaces[0];
-  const workspaceKey = path.resolve(workdir);
-  const occupyingSessionKey = runningWorkspaces.get(workspaceKey);
+  const workdir = session.workdir || config.projects[0];
+  const projectKey = path.resolve(workdir);
+  const occupyingSessionKey = runningProjects.get(projectKey);
   if (occupyingSessionKey && occupyingSessionKey !== target.key) {
     const occupyingSession = getSession(occupyingSessionKey);
-    await sendOrEditStartMessage(`Workspace is already running another session: /${occupyingSession.workspaceCommand || workspaceAliasForPath(occupyingSession.workdir)}. Reply later or stop that session with /stop.`);
+    await sendOrEditStartMessage(`Project is already running another session: /${occupyingSession.projectCommand || projectAliasForPath(occupyingSession.workdir)}. Reply later or stop that session with /stop.`);
     return;
   }
   const sandbox = session.sandbox || config.defaultSandbox;
@@ -1172,9 +1172,9 @@ async function runCodex(target, prompt, options = {}) {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  const run = { child, live, replaced: false, workspaceKey };
+  const run = { child, live, replaced: false, projectKey };
   running.set(target.key, run);
-  runningWorkspaces.set(workspaceKey, target.key);
+  runningProjects.set(projectKey, target.key);
 
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
@@ -1200,7 +1200,7 @@ async function runCodex(target, prompt, options = {}) {
     if (run.replaced) return;
     if (stdoutBuffer.trim()) handleJsonLine(live, session, stdoutBuffer.trim());
     if (running.get(target.key)?.child === child) running.delete(target.key);
-    if (runningWorkspaces.get(workspaceKey) === target.key) runningWorkspaces.delete(workspaceKey);
+    if (runningProjects.get(projectKey) === target.key) runningProjects.delete(projectKey);
     saveState();
     addLive(live, code === 0 ? "completed" : `failed with exit code ${code}`);
     await flushLive(live, true);
@@ -1353,8 +1353,8 @@ function getSession(sessionKey) {
   const key = String(sessionKey);
   state.sessions ||= {};
   state.sessions[key] ||= {
-    workdir: config.workspaces[0],
-    workspaceCommand: workspaceAliasForPath(config.workspaces[0]),
+    workdir: config.projects[0],
+    projectCommand: projectAliasForPath(config.projects[0]),
     sandbox: config.defaultSandbox,
     approvalPolicy: config.defaultApprovalPolicy,
     model: config.defaultModel,
@@ -1362,9 +1362,9 @@ function getSession(sessionKey) {
   return state.sessions[key];
 }
 
-function createTelegramWorkspaceSession(chatId, workspaceCommand) {
+function createTelegramProjectSession(chatId, projectCommand) {
   const now = new Date().toISOString();
-  const sessionId = createSessionId(workspaceCommand.alias);
+  const sessionId = createSessionId(projectCommand.alias);
   const key = `telegram:${chatId}:${sessionId}`;
   state.sessions ||= {};
   state.sessions[key] = {
@@ -1372,8 +1372,8 @@ function createTelegramWorkspaceSession(chatId, workspaceCommand) {
     key,
     adapter: "telegram",
     chatId: String(chatId),
-    workdir: workspaceCommand.workdir,
-    workspaceCommand: workspaceCommand.alias,
+    workdir: projectCommand.workdir,
+    projectCommand: projectCommand.alias,
     sandbox: config.defaultSandbox,
     approvalPolicy: config.defaultApprovalPolicy,
     model: config.defaultModel,
@@ -1411,10 +1411,10 @@ function findTelegramSessionKeyByMessage(chatId, messageId) {
   return state.telegramMessageIndex[telegramMessageIndexKey(chatId, messageId)] || "";
 }
 
-function workspaceAliasForPath(workdir) {
-  const resolved = path.resolve(workdir || config.workspaces[0]);
-  for (const [alias, workspace] of config.workspaceCommands.entries()) {
-    if (path.resolve(workspace) === resolved) return alias;
+function projectAliasForPath(workdir) {
+  const resolved = path.resolve(workdir || config.projects[0]);
+  for (const [alias, project] of config.projectCommands.entries()) {
+    if (path.resolve(project) === resolved) return alias;
   }
   return path.basename(resolved).toLowerCase().replace(/[^\w]+/g, "_");
 }
@@ -1427,8 +1427,8 @@ function statusText(sessionKey) {
     "",
     `running: ${isRunning ? "yes" : "no"}`,
     `waiting answer: ${session.pendingAnswer ? "yes" : "no"}`,
-    `workdir: ${session.workdir || config.workspaces[0]}`,
-    `workspace commands: ${formatWorkspaceCommands(config.workspaceCommands) || "none"}`,
+    `workdir: ${session.workdir || config.projects[0]}`,
+    `project commands: ${formatProjectCommands(config.projectCommands) || "none"}`,
     `sandbox: ${session.sandbox || config.defaultSandbox}`,
     `approval: ${session.approvalPolicy || config.defaultApprovalPolicy}`,
     `skip git repo check: ${config.skipGitRepoCheck ? "yes" : "no"}`,
@@ -1455,10 +1455,9 @@ function helpText() {
     "/resume - show saved thread",
     "/stop - stop current turn",
     "/cancel - clear pending answer mode",
-    "/repo - choose workspace",
-    "/commands - list workspace commands",
+    "/projects - list, switch, create, or delete projects",
     "/schedule - manage persistent Codex cron tasks",
-    workspaceHelpLine(),
+    projectHelpLine(),
     "/model [name] - show or set model",
     "/sandbox [read-only|workspace-write|danger-full-access] - show or set sandbox",
     "/approval [untrusted|on-request|on-failure|never] - show or set approval policy",
@@ -1470,10 +1469,10 @@ function helpText() {
 function statusKeyboard() {
   return {
     inline_keyboard: [
-      [{ text: "Read only", callback_data: "sandbox:read-only" }, { text: "Workspace write", callback_data: "sandbox:workspace-write" }],
+      [{ text: "Read only", callback_data: "sandbox:read-only" }, { text: "Project write", callback_data: "sandbox:workspace-write" }],
       [{ text: "Danger full access", callback_data: "sandbox:danger-full-access" }],
       [{ text: "Ask on request", callback_data: "approval:on-request" }, { text: "Ask untrusted", callback_data: "approval:untrusted" }],
-      [{ text: "Choose workspace", callback_data: "repo:0" }, { text: "Stop", callback_data: "stop" }],
+      [{ text: "Projects", callback_data: "project:list" }, { text: "Stop", callback_data: "stop" }],
     ],
   };
 }
@@ -1482,7 +1481,7 @@ function sandboxKeyboard() {
   return {
     inline_keyboard: [[
       { text: "Read only", callback_data: "sandbox:read-only" },
-      { text: "Workspace write", callback_data: "sandbox:workspace-write" },
+      { text: "Project write", callback_data: "sandbox:workspace-write" },
       { text: "Danger full access", callback_data: "sandbox:danger-full-access" },
     ]],
   };
@@ -1494,15 +1493,6 @@ function approvalKeyboard() {
       [{ text: "On request", callback_data: "approval:on-request" }, { text: "Untrusted", callback_data: "approval:untrusted" }],
       [{ text: "On failure", callback_data: "approval:on-failure" }, { text: "Never", callback_data: "approval:never" }],
     ],
-  };
-}
-
-function repoKeyboard() {
-  return {
-    inline_keyboard: config.workspaces.map((workspace, index) => ([{
-      text: `${index + 1}. ${workspace}`,
-      callback_data: `repo:${index}`,
-    }])),
   };
 }
 
@@ -1524,7 +1514,7 @@ function mediaKeyboard(mediaId) {
   };
 }
 
-function switchSessionWorkspace(session, workdir) {
+function switchSessionProject(session, workdir) {
   session.workdir = workdir;
   delete session.threadId;
   delete session.pendingAnswer;
@@ -1538,7 +1528,7 @@ function cancelRunningSession(target) {
 
   run.replaced = true;
   running.delete(target.key);
-  if (run.workspaceKey && runningWorkspaces.get(run.workspaceKey) === target.key) runningWorkspaces.delete(run.workspaceKey);
+  if (run.projectKey && runningProjects.get(run.projectKey) === target.key) runningProjects.delete(run.projectKey);
   run.child.kill("SIGTERM");
   setTimeout(() => {
     if (!run.child.killed) run.child.kill("SIGKILL");
@@ -1546,15 +1536,15 @@ function cancelRunningSession(target) {
   return true;
 }
 
-function parseWorkspaceCommand(text) {
+function parseProjectCommand(text) {
   const trimmed = String(text || "").trim();
-  if (!trimmed || config.workspaceCommands.size === 0) return null;
+  if (!trimmed || config.projectCommands.size === 0) return null;
 
   const match = trimmed.match(/^\/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s+|$)([\s\S]*)/);
   if (!match) return null;
 
   const alias = match[1].toLowerCase();
-  const workdir = config.workspaceCommands.get(alias);
+  const workdir = config.projectCommands.get(alias);
   if (!workdir) return null;
 
   return {
@@ -1564,61 +1554,61 @@ function parseWorkspaceCommand(text) {
   };
 }
 
-function parseWorkspaceDeleteCommand(text) {
+function parseProjectDeleteCommand(text) {
   const trimmed = String(text || "").trim();
   const match = trimmed.match(/^\/delete_([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s+|$)/);
   if (!match) return null;
   const alias = match[1].toLowerCase();
-  const workdir = config.workspaceCommands.get(alias);
+  const workdir = config.projectCommands.get(alias);
   if (!workdir) return null;
   return { alias, workdir };
 }
 
-function parseWorkspaceCommandSpec(spec, workspaces) {
+function parseProjectCommandSpec(spec, projects) {
   const commands = new Map();
-  for (const workspace of workspaces) {
-    addWorkspaceAlias(commands, path.basename(workspace), workspace);
+  for (const project of projects) {
+    addProjectAlias(commands, path.basename(project), project);
   }
-  if (workspaces.includes("/home/agent")) addWorkspaceAlias(commands, "agent", "/home/agent");
+  if (projects.includes("/home/agent")) addProjectAlias(commands, "agent", "/home/agent");
 
   for (const item of csv(spec)) {
     const match = item.match(/^\/?([A-Za-z0-9_]+)=(.+)$/);
-    if (!match) throw new Error(`Invalid WORKSPACE_COMMANDS entry: ${item}`);
+    if (!match) throw new Error(`Invalid PROJECT_COMMANDS entry: ${item}`);
     const alias = match[1].toLowerCase();
     const workdir = path.resolve(match[2].trim());
-    if (!workspaces.includes(workdir)) {
-      throw new Error(`WORKSPACE_COMMANDS path must be present in WORKSPACE_ALLOWLIST: ${workdir}`);
+    if (!projects.includes(workdir)) {
+      throw new Error(`PROJECT_COMMANDS path must be present in PROJECT_ALLOWLIST: ${workdir}`);
     }
-    addWorkspaceAlias(commands, alias, workdir);
+    addProjectAlias(commands, alias, workdir);
   }
   return commands;
 }
 
-function addWorkspaceAlias(commands, alias, workdir) {
+function addProjectAlias(commands, alias, workdir) {
   const normalized = String(alias || "").trim().toLowerCase();
   if (!normalized || !/^[a-z0-9_]+$/.test(normalized)) return;
   commands.set(normalized, workdir);
 }
 
-function formatWorkspaceCommands(commands) {
+function formatProjectCommands(commands) {
   return [...commands.entries()].map(([alias, workdir]) => `/${alias}=${workdir}`).join(", ");
 }
 
-function workspaceCommandsText() {
-  const entries = [...config.workspaceCommands.entries()];
+function projectCommandsText() {
+  const entries = [...config.projectCommands.entries()];
   if (entries.length === 0) {
     return [
-      "Workspace commands",
+      "Project commands",
       "",
-      "No workspace commands configured.",
+      "No project commands configured.",
       "",
-      `Create root: ${config.workspaceCreateRoot}`,
+      `Create root: ${config.projectCreateRoot}`,
     ].join("\n");
   }
   return [
-    "Workspace commands",
+    "Project commands",
     "",
-    `Create root: ${config.workspaceCreateRoot}`,
+    `Create root: ${config.projectCreateRoot}`,
     "",
     ...entries.map(([alias, workdir]) => [
       `/${alias} - ${workdir}`,
@@ -1627,23 +1617,27 @@ function workspaceCommandsText() {
   ].join("\n");
 }
 
-function workspaceCommandsKeyboard() {
+function projectCommandsKeyboard() {
   return {
-    inline_keyboard: [[
-      { text: "Create new workspace", callback_data: "workspace:create" },
-    ]],
+    inline_keyboard: [
+      ...config.projects.map((project, index) => ([{
+        text: `${index + 1}. ${projectAliasForPath(project)}`,
+        callback_data: `project:select:${index}`,
+      }])),
+      [{ text: "Create new project", callback_data: "project:create" }],
+    ],
   };
 }
 
-function workspaceHelpLine() {
-  const commands = formatWorkspaceCommands(config.workspaceCommands);
-  if (!commands) return "/<workspace> [task] - switch workspace mode";
-  return `/<workspace> [task] - switch workspace mode (${commands})`;
+function projectHelpLine() {
+  const commands = formatProjectCommands(config.projectCommands);
+  if (!commands) return "/<project> [task] - switch project mode";
+  return `/<project> [task] - switch project mode (${commands})`;
 }
 
-function firstWorkspaceCommandExample() {
-  const first = config.workspaceCommands.keys().next().value;
-  return first ? `/${first} <task>` : "/<workspace> <task>";
+function firstProjectCommandExample() {
+  const first = config.projectCommands.keys().next().value;
+  return first ? `/${first} <task>` : "/<project> <task>";
 }
 
 async function sendMessage(chatId, text, extra = {}) {
@@ -1709,7 +1703,7 @@ async function sendInboxMediaMessage(target, record) {
     target.chatId,
     record.file.path,
     record.file.mimeType || "application/octet-stream",
-    withWorkspaceSignature(formatInboxMediaCaption(record), session),
+    withProjectSignature(formatInboxMediaCaption(record), session),
     mediaKeyboard(record.mediaId),
     telegramSessionReplyExtra(session),
   );
@@ -1747,7 +1741,7 @@ function collabmdTarget(sessionId) {
 async function sendBridgeMessage(target, text, extra = {}) {
   if (target.adapter === "telegram") {
     const session = getSession(target.key);
-    const message = await sendMessage(target.chatId, withWorkspaceSignature(text, session), {
+    const message = await sendMessage(target.chatId, withProjectSignature(text, session), {
       ...telegramSessionReplyExtra(session),
       ...extra,
     });
@@ -1766,7 +1760,7 @@ async function sendBridgeLong(target, text) {
 
 async function sendSessionLong(target, text) {
   const session = getSession(target.key);
-  const signed = withWorkspaceSignature(text, session);
+  const signed = withProjectSignature(text, session);
   const chunks = chunkTelegramHtmlText(signed, config.maxTelegramChars);
   const replyExtra = telegramSessionReplyExtra(session);
   for (const chunk of chunks) {
@@ -1796,7 +1790,7 @@ async function editBridgeMessage(target, messageId, text, replyMarkup) {
     const session = getSession(target.key);
     session.lastBotActivityAt = new Date().toISOString();
     bindTelegramMessageToSession(target, messageId);
-    return editTelegramMessageText(target.chatId, messageId, withWorkspaceSignature(text, session), replyMarkup);
+    return editTelegramMessageText(target.chatId, messageId, withProjectSignature(text, session), replyMarkup);
   }
   return pushCollabmdOutbox(target.sessionId, "edit", {
     message_id: messageId,
@@ -1805,16 +1799,16 @@ async function editBridgeMessage(target, messageId, text, replyMarkup) {
   });
 }
 
-function withWorkspaceSignature(text, session) {
-  const signature = workspaceSignature(session);
+function withProjectSignature(text, session) {
+  const signature = projectSignature(session);
   const value = String(text || "");
   if (!signature) return value;
   if (value.trimEnd().endsWith(signature)) return value;
   return `${value.trimEnd()}\n\n${signature}`;
 }
 
-function workspaceSignature(session) {
-  const alias = String(session?.workspaceCommand || workspaceAliasForPath(session?.workdir) || "").trim();
+function projectSignature(session) {
+  const alias = String(session?.projectCommand || projectAliasForPath(session?.workdir) || "").trim();
   return alias ? `/${alias}` : "";
 }
 
@@ -2441,7 +2435,7 @@ async function saveInboxAttachment(session, attachment) {
     throw new Error(`${attachment.mediaType} is too large: ${attachment.fileSize} bytes. Limit: ${config.maxInboxFileBytes} bytes.`);
   }
 
-  const workdir = session.workdir || config.workspaces[0];
+  const workdir = session.workdir || config.projects[0];
   const inboxDir = path.join(workdir, "Inbox");
   mkdirSync(inboxDir, { recursive: true, mode: 0o700 });
   return downloadTelegramFile(attachment.fileId, inboxDir, attachment.fileName, {
@@ -2452,14 +2446,14 @@ async function saveInboxAttachment(session, attachment) {
 }
 
 function recordInboxMedia(session, message, attachment, inboxPath) {
-  const workspace = session.workdir || config.workspaces[0];
+  const project = session.workdir || config.projects[0];
   const record = createTelegramMediaRecord({
-    workspace,
+    project,
     message,
     attachment,
     filePath: inboxPath,
   });
-  return upsertMediaRecord(workspace, record).item;
+  return upsertMediaRecord(project, record).item;
 }
 
 function recordInboxEchoMessage(session, record, echoMessage) {
@@ -2467,8 +2461,8 @@ function recordInboxEchoMessage(session, record, echoMessage) {
   const chatId = echoMessage?.chat?.id || record?.telegram?.chatId || "";
   if (!record?.mediaId || !messageId) return;
 
-  const workspace = session.workdir || config.workspaces[0];
-  addTelegramMessageAlias(workspace, record.mediaId, chatId, messageId);
+  const project = session.workdir || config.projects[0];
+  addTelegramMessageAlias(project, record.mediaId, chatId, messageId);
 }
 
 async function getReplyInboxContext(session, message) {
@@ -2479,15 +2473,15 @@ async function getReplyInboxContext(session, message) {
     ...reply,
     chat: reply.chat || message.chat,
   };
-  const workspace = session.workdir || config.workspaces[0];
-  const found = findReplyMediaRecord(workspace, replyMessage)
-    || findReplyMediaRecordInOtherWorkspaces(workspace, replyMessage);
+  const project = session.workdir || config.projects[0];
+  const found = findReplyMediaRecord(project, replyMessage)
+    || findReplyMediaRecordInOtherProjects(project, replyMessage);
   if (!found) {
     if (!getInboxAttachment(replyMessage) && !parseMediaId(replyMessage.caption || replyMessage.text || "")) return null;
     throw new Error("запись для этого Telegram-сообщения отсутствует");
   }
 
-  const inboxPath = mediaRecordFilePath(found.workspace, found.item);
+  const inboxPath = mediaRecordFilePath(found.project, found.item);
   if (!inboxPath || !existsSync(inboxPath)) {
     throw new Error(found.item.file?.relativePath || found.item.file?.path || "локальный файл отсутствует");
   }
@@ -2495,27 +2489,27 @@ async function getReplyInboxContext(session, message) {
   return { record: found.item, path: inboxPath };
 }
 
-function findReplyMediaRecordInOtherWorkspaces(currentWorkspace, message) {
-  const current = path.resolve(currentWorkspace);
-  for (const workspace of config.workspaces) {
-    if (path.resolve(workspace) === current) continue;
-    const found = findReplyMediaRecord(workspace, message);
+function findReplyMediaRecordInOtherProjects(currentProject, message) {
+  const current = path.resolve(currentProject);
+  for (const project of config.projects) {
+    if (path.resolve(project) === current) continue;
+    const found = findReplyMediaRecord(project, message);
     if (found) return found;
   }
   return null;
 }
 
-function findReplyMediaRecord(workspace, message) {
-  const item = peekMediaByTelegramMessage(workspace, message.chat.id, message.message_id)
-    || getReplyMediaByCaption(workspace, message);
-  return item ? { workspace, item } : null;
+function findReplyMediaRecord(project, message) {
+  const item = peekMediaByTelegramMessage(project, message.chat.id, message.message_id)
+    || getReplyMediaByCaption(project, message);
+  return item ? { project, item } : null;
 }
 
-function getReplyMediaByCaption(workspace, message) {
+function getReplyMediaByCaption(project, message) {
   const mediaId = parseMediaId(message.caption || message.text || "");
   if (!mediaId) return null;
   try {
-    return getMediaItem(workspace, mediaId, { sync: false });
+    return getMediaItem(project, mediaId, { sync: false });
   } catch {
     return null;
   }
@@ -2526,8 +2520,8 @@ function parseMediaId(text) {
   return match ? match[1] : "";
 }
 
-function mediaRecordFilePath(workspace, item) {
-  if (item?.file?.relativePath) return path.resolve(workspace, item.file.relativePath);
+function mediaRecordFilePath(project, item) {
+  if (item?.file?.relativePath) return path.resolve(project, item.file.relativePath);
   if (item?.file?.path) return path.resolve(item.file.path);
   return "";
 }
@@ -2552,11 +2546,11 @@ function formatInboxMediaCaption(record) {
   ].filter(Boolean).join("\n");
 }
 
-function formatMediaInfo(workspace, item) {
+function formatMediaInfo(project, item) {
   return [
     "Media info",
     `mediaId: ${item.mediaId}`,
-    `workspace: ${workspace}`,
+    `project: ${project}`,
     `type: ${item.file?.mediaType || ""}`,
     `mime: ${item.file?.mimeType || ""}`,
     `file: ${item.file?.path || ""}`,
@@ -2678,8 +2672,8 @@ async function runSttCommand(wavPath) {
   return result.stdout;
 }
 
-async function runWorkspaceManager(command, args = []) {
-  const result = await runProcess(path.join(ROOT, "scripts", "workspace-manager"), [command, ...args], {
+async function runProjectManager(command, args = []) {
+  const result = await runProcess(path.join(ROOT, "scripts", "project-manager"), [command, ...args], {
     cwd: ROOT,
     timeoutMs: 30000,
     env: process.env,
@@ -2687,23 +2681,23 @@ async function runWorkspaceManager(command, args = []) {
   try {
     return JSON.parse(result.stdout);
   } catch {
-    throw new Error(`workspace-manager returned invalid JSON: ${clean(result.stdout).slice(0, 500)}`);
+    throw new Error(`project-manager returned invalid JSON: ${clean(result.stdout).slice(0, 500)}`);
   }
 }
 
-function applyWorkspaceManagerResult(result) {
-  if (!result?.ok) throw new Error("workspace-manager did not report success");
-  const workspaces = Array.isArray(result.workspaces) ? result.workspaces.map(item => path.resolve(item)) : [];
-  const commandEntries = Object.entries(result.workspaceCommands || {});
-  if (!workspaces.length) throw new Error("workspace-manager returned no workspaces");
+function applyProjectManagerResult(result) {
+  if (!result?.ok) throw new Error("project-manager did not report success");
+  const projects = Array.isArray(result.projects) ? result.projects.map(item => path.resolve(item)) : [];
+  const commandEntries = Object.entries(result.projectCommands || {});
+  if (!projects.length) throw new Error("project-manager returned no projects");
 
-  config.workspaces = workspaces;
-  config.workspaceCreateRoot = path.resolve(result.createRoot || config.workspaceCreateRoot);
-  config.workspaceCommandSpec = commandEntries.map(([alias, workspace]) => `${alias}=${path.resolve(workspace)}`).join(",");
-  config.workspaceCommands = parseWorkspaceCommandSpec(config.workspaceCommandSpec, config.workspaces);
-  process.env.WORKSPACE_ALLOWLIST = config.workspaces.join(",");
-  process.env.WORKSPACE_COMMANDS = config.workspaceCommandSpec;
-  process.env.WORKSPACE_CREATE_ROOT = config.workspaceCreateRoot;
+  config.projects = projects;
+  config.projectCreateRoot = path.resolve(result.createRoot || config.projectCreateRoot);
+  config.projectCommandSpec = commandEntries.map(([alias, project]) => `${alias}=${path.resolve(project)}`).join(",");
+  config.projectCommands = parseProjectCommandSpec(config.projectCommandSpec, config.projects);
+  process.env.PROJECT_ALLOWLIST = config.projects.join(",");
+  process.env.PROJECT_COMMANDS = config.projectCommandSpec;
+  process.env.PROJECT_CREATE_ROOT = config.projectCreateRoot;
 }
 
 function runProcess(cmd, args, options = {}) {

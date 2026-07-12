@@ -57,7 +57,7 @@ function main() {
       description: args.description || "",
       cron: required(args, "cron"),
       timeZone: required(args, "timezone"),
-      workspace: required(args, "workspace"),
+      project: required(args, "project"),
       prompt: required(args, "prompt"),
       status: args.status || (args.enabled === undefined ? "enabled" : undefined),
       enabled: args.enabled === undefined ? true : !["0", "false", "no", "off"].includes(String(args.enabled).toLowerCase()),
@@ -76,7 +76,7 @@ function main() {
       description: args.description ?? existing.description,
       cron: args.cron ?? existing.cron,
       timeZone: args.timezone ?? existing.timeZone,
-      workspace: args.workspace ?? existing.workspace,
+      project: args.project ?? existing.project,
       prompt: args.prompt ?? existing.prompt,
       status: args.status ?? existing.status,
       enabled: statusToEnabled(args.status, existing.enabled),
@@ -189,7 +189,7 @@ function formatList(user, tasks) {
       task.description ? `does: ${task.description}` : "",
       `runs: ${task.cron} (${task.timeZone})`,
       task.nextRunLocal ? `next: ${task.nextRunLocal} ${task.timeZone}` : "",
-      `workspace: ${task.workspace}`,
+      `project: ${task.project}`,
       `edit: /edit_task_${task.id}`,
       `delete: /delete_task_${task.id}`,
     ].filter(Boolean).join("\n")),
@@ -206,8 +206,8 @@ function help() {
   schedule-task list --chat-id <id> [--json]
   schedule-task show --chat-id <id> --name <taskName>
   schedule-task set-timezone --chat-id <id> --timezone <IANA zone>
-  schedule-task upsert --chat-id <id> --name <taskName> [--title <text>] --description <text> --cron "0 9 * * *" --timezone <IANA zone> --workspace <path> --prompt <text> [--status enabled|disabled]
-  schedule-task patch --chat-id <id> --name <taskNameOrId> [--new-name <taskName>] [--title <text>] [--description <text>] [--cron "0 9 * * *"] [--timezone <IANA zone>] [--workspace <path>] [--prompt <text>] [--status enabled|disabled]
+  schedule-task upsert --chat-id <id> --name <taskName> [--title <text>] --description <text> --cron "0 9 * * *" --timezone <IANA zone> --project <path> --prompt <text> [--status enabled|disabled]
+  schedule-task patch --chat-id <id> --name <taskNameOrId> [--new-name <taskName>] [--title <text>] [--description <text>] [--cron "0 9 * * *"] [--timezone <IANA zone>] [--project <path>] [--prompt <text>] [--status enabled|disabled]
   schedule-task enable --chat-id <id> --name <taskNameOrId>
   schedule-task disable --chat-id <id> --name <taskNameOrId>
   schedule-task rename --chat-id <id> --name <taskNameOrId> --new-name <taskName> [--title <text>]

@@ -17,31 +17,31 @@ const INDEX_VERSION = 1;
 const LOCK_TIMEOUT_MS = 10000;
 const STALE_LOCK_MS = 30000;
 
-export function resolveWorkspace(workspace = process.cwd()) {
-  return path.resolve(workspace || process.cwd());
+export function resolveProject(project = process.cwd()) {
+  return path.resolve(project || process.cwd());
 }
 
-export function mediaIndexPath(workspace = process.cwd()) {
-  return path.join(resolveWorkspace(workspace), MEDIA_INDEX_RELATIVE_PATH);
+export function mediaIndexPath(project = process.cwd()) {
+  return path.join(resolveProject(project), MEDIA_INDEX_RELATIVE_PATH);
 }
 
-export function initMediaIndex(workspace = process.cwd()) {
-  return withMediaIndexLock(workspace, () => {
-    const index = loadMediaIndexUnlocked(workspace);
-    saveMediaIndexUnlocked(workspace, index);
+export function initMediaIndex(project = process.cwd()) {
+  return withMediaIndexLock(project, () => {
+    const index = loadMediaIndexUnlocked(project);
+    saveMediaIndexUnlocked(project, index);
     return index;
   });
 }
 
-export function loadMediaIndex(workspace = process.cwd(), options = {}) {
-  if (options.sync) return syncMediaIndex(workspace).index;
-  return loadMediaIndexUnlocked(workspace);
+export function loadMediaIndex(project = process.cwd(), options = {}) {
+  if (options.sync) return syncMediaIndex(project).index;
+  return loadMediaIndexUnlocked(project);
 }
 
-export function upsertMediaRecord(workspace, record) {
-  assertRecordFile(workspace, record);
-  return withMediaIndexLock(workspace, () => {
-    const index = pruneMissingItems(workspace, loadMediaIndexUnlocked(workspace));
+export function upsertMediaRecord(project, record) {
+  assertRecordFile(project, record);
+  return withMediaIndexLock(project, () => {
+    const index = pruneMissingItems(project, loadMediaIndexUnlocked(project));
     const existing = index.items[record.mediaId] || {};
     const item = {
       ...record,
@@ -52,17 +52,17 @@ export function upsertMediaRecord(workspace, record) {
     index.items[item.mediaId] = item;
     rebuildTelegramMessageIndex(index);
     index.updatedAt = nowIso();
-    saveMediaIndexUnlocked(workspace, index);
+    saveMediaIndexUnlocked(project, index);
     return { index, item };
   });
 }
 
-export function addTelegramMessageAlias(workspace, mediaId, chatId, messageId) {
-  return withMediaIndexLock(workspace, () => {
-    const index = pruneMissingItems(workspace, loadMediaIndexUnlocked(workspace));
+export function addTelegramMessageAlias(project, mediaId, chatId, messageId) {
+  return withMediaIndexLock(project, () => {
+    const index = pruneMissingItems(project, loadMediaIndexUnlocked(project));
     const item = index.items[mediaId];
     if (!item) throw new Error(`Media item not found: ${mediaId}`);
-    assertItemFileExists(workspace, item);
+    assertItemFileExists(project, item);
 
     item.telegram ||= {};
     item.telegram.relatedMessageIds = normalizeRelatedMessageIds(item.telegram.relatedMessageIds);
@@ -74,40 +74,40 @@ export function addTelegramMessageAlias(workspace, mediaId, chatId, messageId) {
 
     rebuildTelegramMessageIndex(index);
     index.updatedAt = nowIso();
-    saveMediaIndexUnlocked(workspace, index);
+    saveMediaIndexUnlocked(project, index);
     return item;
   });
 }
 
-export function setMediaDescription(workspace, mediaId, description) {
-  return withMediaIndexLock(workspace, () => {
-    const index = pruneMissingItems(workspace, loadMediaIndexUnlocked(workspace));
+export function setMediaDescription(project, mediaId, description) {
+  return withMediaIndexLock(project, () => {
+    const index = pruneMissingItems(project, loadMediaIndexUnlocked(project));
     const item = index.items[mediaId];
     if (!item) throw new Error(`Media item not found: ${mediaId}`);
-    assertItemFileExists(workspace, item);
+    assertItemFileExists(project, item);
     item.description = String(description || "").trim();
     item.descriptionStatus = item.description ? "described" : "pending";
     item.descriptionUpdatedAt = item.description ? nowIso() : "";
     index.updatedAt = nowIso();
-    saveMediaIndexUnlocked(workspace, index);
+    saveMediaIndexUnlocked(project, index);
     return item;
   });
 }
 
-export function deleteMediaItem(workspace, mediaId) {
-  return withMediaIndexLock(workspace, () => {
-    const index = loadMediaIndexUnlocked(workspace);
+export function deleteMediaItem(project, mediaId) {
+  return withMediaIndexLock(project, () => {
+    const index = loadMediaIndexUnlocked(project);
     const item = index.items[mediaId];
     if (!item) {
-      const pruned = pruneMissingItems(workspace, index);
-      saveMediaIndexUnlocked(workspace, pruned);
+      const pruned = pruneMissingItems(project, index);
+      saveMediaIndexUnlocked(project, pruned);
       return { deleted: false, fileDeleted: false, item: null, filePath: "" };
     }
 
     let filePath = "";
     let fileDeleted = false;
     try {
-      filePath = itemAbsolutePath(workspace, item);
+      filePath = itemAbsolutePath(project, item);
       if (existsSync(filePath)) {
         unlinkSync(filePath);
         fileDeleted = true;
@@ -117,28 +117,28 @@ export function deleteMediaItem(workspace, mediaId) {
     }
 
     delete index.items[mediaId];
-    pruneMissingItems(workspace, index);
+    pruneMissingItems(project, index);
     index.updatedAt = nowIso();
-    saveMediaIndexUnlocked(workspace, index);
+    saveMediaIndexUnlocked(project, index);
     return { deleted: true, fileDeleted, item, filePath };
   });
 }
 
-export function moveMediaItem(workspace, mediaId, destination, options = {}) {
-  return withMediaIndexLock(workspace, () => {
-    const workspacePath = resolveWorkspace(workspace);
-    const index = pruneMissingItems(workspacePath, loadMediaIndexUnlocked(workspacePath));
+export function moveMediaItem(project, mediaId, destination, options = {}) {
+  return withMediaIndexLock(project, () => {
+    const projectPath = resolveProject(project);
+    const index = pruneMissingItems(projectPath, loadMediaIndexUnlocked(projectPath));
     const item = index.items[mediaId];
     if (!item) throw new Error(`Media item not found: ${mediaId}`);
 
-    const fromPath = itemAbsolutePath(workspacePath, item);
-    const toPath = resolveMoveDestination(workspacePath, fromPath, destination);
-    assertInsideWorkspace(workspacePath, toPath);
+    const fromPath = itemAbsolutePath(projectPath, item);
+    const toPath = resolveMoveDestination(projectPath, fromPath, destination);
+    assertInsideProject(projectPath, toPath);
 
     if (fromPath === toPath) {
-      updateItemFilePath(workspacePath, item, toPath);
+      updateItemFilePath(projectPath, item, toPath);
       index.updatedAt = nowIso();
-      saveMediaIndexUnlocked(workspacePath, index);
+      saveMediaIndexUnlocked(projectPath, index);
       return { moved: false, overwritten: false, from: fromPath, to: toPath, item };
     }
 
@@ -151,88 +151,88 @@ export function moveMediaItem(workspace, mediaId, destination, options = {}) {
 
     mkdirSync(path.dirname(toPath), { recursive: true, mode: 0o700 });
     renameSync(fromPath, toPath);
-    updateItemFilePath(workspacePath, item, toPath);
+    updateItemFilePath(projectPath, item, toPath);
     index.updatedAt = nowIso();
-    saveMediaIndexUnlocked(workspacePath, index);
+    saveMediaIndexUnlocked(projectPath, index);
     return { moved: true, overwritten, from: fromPath, to: toPath, item };
   });
 }
 
-export function findMediaWorkspace(workspaces, mediaId) {
-  for (const workspace of workspaces) {
+export function findMediaProject(projects, mediaId) {
+  for (const project of projects) {
     try {
-      const item = getMediaItem(workspace, mediaId, { sync: true });
-      if (item) return { workspace: resolveWorkspace(workspace), item };
+      const item = getMediaItem(project, mediaId, { sync: true });
+      if (item) return { project: resolveProject(project), item };
     } catch {
-      // Keep searching other workspaces; a stale index should not break callbacks.
+      // Keep searching other projects; a stale index should not break callbacks.
     }
   }
   return null;
 }
 
-export function listMediaItems(workspace = process.cwd(), options = {}) {
-  const index = loadMediaIndex(workspace, { sync: options.sync !== false });
+export function listMediaItems(project = process.cwd(), options = {}) {
+  const index = loadMediaIndex(project, { sync: options.sync !== false });
   let items = Object.values(index.items);
   if (options.status) items = items.filter(item => item.descriptionStatus === options.status);
   return items.sort((a, b) => String(b.savedAt || "").localeCompare(String(a.savedAt || "")));
 }
 
-export function getMediaItem(workspace, mediaId, options = {}) {
-  const index = loadMediaIndex(workspace, { sync: options.sync !== false });
+export function getMediaItem(project, mediaId, options = {}) {
+  const index = loadMediaIndex(project, { sync: options.sync !== false });
   const item = index.items[mediaId];
   if (!item) return null;
-  assertItemFileExists(workspace, item);
+  assertItemFileExists(project, item);
   return item;
 }
 
-export function findMediaByTelegramMessage(workspace, chatId, messageId, options = {}) {
-  const index = loadMediaIndex(workspace, { sync: options.sync !== false });
+export function findMediaByTelegramMessage(project, chatId, messageId, options = {}) {
+  const index = loadMediaIndex(project, { sync: options.sync !== false });
   const mediaId = index.telegramMessageIndex[telegramMessageKey(chatId, messageId)];
   if (!mediaId) return null;
   const item = index.items[mediaId] || null;
-  if (item) assertItemFileExists(workspace, item);
+  if (item) assertItemFileExists(project, item);
   return item;
 }
 
-export function peekMediaByTelegramMessage(workspace, chatId, messageId) {
-  const index = loadMediaIndex(workspace, { sync: false });
+export function peekMediaByTelegramMessage(project, chatId, messageId) {
+  const index = loadMediaIndex(project, { sync: false });
   const mediaId = index.telegramMessageIndex[telegramMessageKey(chatId, messageId)];
   if (!mediaId) return null;
   return index.items[mediaId] || null;
 }
 
-export function syncMediaIndex(workspace = process.cwd()) {
-  return withMediaIndexLock(workspace, () => {
-    const before = loadMediaIndexUnlocked(workspace);
+export function syncMediaIndex(project = process.cwd()) {
+  return withMediaIndexLock(project, () => {
+    const before = loadMediaIndexUnlocked(project);
     const beforeCount = Object.keys(before.items).length;
-    const index = pruneMissingItems(workspace, before);
+    const index = pruneMissingItems(project, before);
     const afterCount = Object.keys(index.items).length;
     if (beforeCount !== afterCount) {
       index.updatedAt = nowIso();
-      saveMediaIndexUnlocked(workspace, index);
+      saveMediaIndexUnlocked(project, index);
     }
     return { index, removed: beforeCount - afterCount };
   });
 }
 
-export function validateMediaIndex(workspace = process.cwd()) {
-  const index = loadMediaIndexUnlocked(workspace);
+export function validateMediaIndex(project = process.cwd()) {
+  const index = loadMediaIndexUnlocked(project);
   const missing = [];
   for (const item of Object.values(index.items)) {
-    if (!itemFileExists(workspace, item)) missing.push(item.mediaId);
+    if (!itemFileExists(project, item)) missing.push(item.mediaId);
   }
   return { ok: missing.length === 0, missing, count: Object.keys(index.items).length };
 }
 
-export function getMediaFilePath(workspace, item) {
-  assertItemFileExists(workspace, item);
-  return itemAbsolutePath(workspace, item);
+export function getMediaFilePath(project, item) {
+  assertItemFileExists(project, item);
+  return itemAbsolutePath(project, item);
 }
 
-export function createLocalMediaRecord({ workspace, filePath, caption = "", source = "codex" }) {
-  const resolvedWorkspace = resolveWorkspace(workspace);
-  const absolutePath = path.resolve(resolvedWorkspace, filePath);
-  assertInsideWorkspace(resolvedWorkspace, absolutePath);
+export function createLocalMediaRecord({ project, filePath, caption = "", source = "codex" }) {
+  const resolvedProject = resolveProject(project);
+  const absolutePath = path.resolve(resolvedProject, filePath);
+  assertInsideProject(resolvedProject, absolutePath);
   if (!existsSync(absolutePath)) throw new Error(`Media file does not exist: ${absolutePath}`);
 
   const stats = statSync(absolutePath);
@@ -256,7 +256,7 @@ export function createLocalMediaRecord({ workspace, filePath, caption = "", sour
     },
     file: {
       path: absolutePath,
-      relativePath: path.relative(resolvedWorkspace, absolutePath),
+      relativePath: path.relative(resolvedProject, absolutePath),
       storedFileName: path.basename(absolutePath),
       originalFileName: path.basename(absolutePath),
       mimeType: guessMimeType(absolutePath),
@@ -272,10 +272,10 @@ export function createLocalMediaRecord({ workspace, filePath, caption = "", sour
   };
 }
 
-export function createTelegramMediaRecord({ workspace, message, attachment, filePath }) {
-  const resolvedWorkspace = resolveWorkspace(workspace);
+export function createTelegramMediaRecord({ project, message, attachment, filePath }) {
+  const resolvedProject = resolveProject(project);
   const absolutePath = path.resolve(filePath);
-  assertInsideWorkspace(resolvedWorkspace, absolutePath);
+  assertInsideProject(resolvedProject, absolutePath);
   if (!existsSync(absolutePath)) throw new Error(`Media file does not exist: ${absolutePath}`);
 
   const stats = statSync(absolutePath);
@@ -300,7 +300,7 @@ export function createTelegramMediaRecord({ workspace, message, attachment, file
     },
     file: {
       path: absolutePath,
-      relativePath: path.relative(resolvedWorkspace, absolutePath),
+      relativePath: path.relative(resolvedProject, absolutePath),
       storedFileName: path.basename(absolutePath),
       originalFileName: attachment.originalFileName || attachment.fileName || path.basename(absolutePath),
       mimeType: attachment.mimeType || guessMimeType(absolutePath),
@@ -316,27 +316,27 @@ export function createTelegramMediaRecord({ workspace, message, attachment, file
   };
 }
 
-function loadMediaIndexUnlocked(workspace = process.cwd()) {
-  const workspacePath = resolveWorkspace(workspace);
-  const file = mediaIndexPath(workspacePath);
-  if (!existsSync(file)) return blankIndex(workspacePath);
+function loadMediaIndexUnlocked(project = process.cwd()) {
+  const projectPath = resolveProject(project);
+  const file = mediaIndexPath(projectPath);
+  if (!existsSync(file)) return blankIndex(projectPath);
   const parsed = JSON.parse(readFileSync(file, "utf8"));
-  return normalizeIndex(workspacePath, parsed);
+  return normalizeIndex(projectPath, parsed);
 }
 
-function saveMediaIndexUnlocked(workspace = process.cwd(), index) {
-  const workspacePath = resolveWorkspace(workspace);
-  const file = mediaIndexPath(workspacePath);
+function saveMediaIndexUnlocked(project = process.cwd(), index) {
+  const projectPath = resolveProject(project);
+  const file = mediaIndexPath(projectPath);
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const normalized = normalizeIndex(workspacePath, index);
+  const normalized = normalizeIndex(projectPath, index);
   normalized.updatedAt ||= nowIso();
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
   renameSync(tmp, file);
 }
 
-function withMediaIndexLock(workspace, fn) {
-  const file = mediaIndexPath(workspace);
+function withMediaIndexLock(project, fn) {
+  const file = mediaIndexPath(project);
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const lockPath = `${file}.lock`;
   const started = Date.now();
@@ -365,10 +365,10 @@ function withMediaIndexLock(workspace, fn) {
   }
 }
 
-function normalizeIndex(workspace, index) {
+function normalizeIndex(project, index) {
   const normalized = {
     version: Number(index?.version || INDEX_VERSION),
-    workspace: resolveWorkspace(workspace),
+    project: resolveProject(project),
     updatedAt: index?.updatedAt || "",
     items: index?.items && typeof index.items === "object" && !Array.isArray(index.items) ? index.items : {},
     telegramMessageIndex: index?.telegramMessageIndex && typeof index.telegramMessageIndex === "object" ? index.telegramMessageIndex : {},
@@ -377,19 +377,19 @@ function normalizeIndex(workspace, index) {
   return normalized;
 }
 
-function blankIndex(workspace) {
+function blankIndex(project) {
   return {
     version: INDEX_VERSION,
-    workspace: resolveWorkspace(workspace),
+    project: resolveProject(project),
     updatedAt: nowIso(),
     items: {},
     telegramMessageIndex: {},
   };
 }
 
-function pruneMissingItems(workspace, index) {
+function pruneMissingItems(project, index) {
   for (const [mediaId, item] of Object.entries(index.items)) {
-    if (!itemFileExists(workspace, item)) delete index.items[mediaId];
+    if (!itemFileExists(project, item)) delete index.items[mediaId];
   }
   rebuildTelegramMessageIndex(index);
   return index;
@@ -412,44 +412,44 @@ function normalizeRelatedMessageIds(value) {
   return [...new Set(items.map(item => String(item || "").trim()).filter(Boolean))];
 }
 
-function assertRecordFile(workspace, record) {
+function assertRecordFile(project, record) {
   if (!record?.mediaId) throw new Error("Media record is missing mediaId");
-  assertItemFileExists(workspace, record);
+  assertItemFileExists(project, record);
 }
 
-function assertItemFileExists(workspace, item) {
-  const file = itemAbsolutePath(workspace, item);
+function assertItemFileExists(project, item) {
+  const file = itemAbsolutePath(project, item);
   if (!existsSync(file)) throw new Error(`Media file does not exist: ${file}`);
 }
 
-function itemFileExists(workspace, item) {
+function itemFileExists(project, item) {
   try {
-    const file = itemAbsolutePath(workspace, item);
+    const file = itemAbsolutePath(project, item);
     return !!file && existsSync(file);
   } catch {
     return false;
   }
 }
 
-function itemAbsolutePath(workspace, item) {
-  const workspacePath = resolveWorkspace(workspace);
+function itemAbsolutePath(project, item) {
+  const projectPath = resolveProject(project);
   const filePath = item?.file?.relativePath
-    ? path.resolve(workspacePath, item.file.relativePath)
+    ? path.resolve(projectPath, item.file.relativePath)
     : item?.file?.path
       ? path.resolve(item.file.path)
       : "";
   if (!filePath) return "";
-  assertInsideWorkspace(workspacePath, filePath);
+  assertInsideProject(projectPath, filePath);
   return filePath;
 }
 
-function resolveMoveDestination(workspace, fromPath, destination) {
+function resolveMoveDestination(project, fromPath, destination) {
   const rawDestination = String(destination || "").trim();
   if (!rawDestination) throw new Error("Destination path is required");
 
   let destinationPath = path.isAbsolute(rawDestination)
     ? path.resolve(rawDestination)
-    : path.resolve(workspace, rawDestination);
+    : path.resolve(project, rawDestination);
 
   if (isDirectoryDestination(rawDestination, destinationPath)) {
     destinationPath = path.join(destinationPath, path.basename(fromPath));
@@ -467,19 +467,19 @@ function isDirectoryDestination(rawDestination, destinationPath) {
   }
 }
 
-function updateItemFilePath(workspace, item, filePath) {
+function updateItemFilePath(project, item, filePath) {
   const stats = statSync(filePath);
   item.file ||= {};
   item.file.path = filePath;
-  item.file.relativePath = path.relative(resolveWorkspace(workspace), filePath);
+  item.file.relativePath = path.relative(resolveProject(project), filePath);
   item.file.storedFileName = path.basename(filePath);
   item.file.sizeBytes = stats.size;
 }
 
-function assertInsideWorkspace(workspace, filePath) {
-  const relative = path.relative(resolveWorkspace(workspace), path.resolve(filePath));
+function assertInsideProject(project, filePath) {
+  const relative = path.relative(resolveProject(project), path.resolve(filePath));
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error(`Path is outside workspace: ${filePath}`);
+    throw new Error(`Path is outside project: ${filePath}`);
   }
 }
 

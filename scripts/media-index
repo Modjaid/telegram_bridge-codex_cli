@@ -24,31 +24,31 @@ loadDotEnv(path.join(ROOT, ".env"));
 const { command, args, options } = parseArgs(process.argv.slice(2));
 
 try {
-  const workspace = options.workspace || process.cwd();
+  const project = options.project || process.cwd();
   let result;
   switch (command) {
     case "init":
-      result = initMediaIndex(workspace);
-      print(options, { ok: true, path: mediaIndexPath(workspace), count: Object.keys(result.items).length });
+      result = initMediaIndex(project);
+      print(options, { ok: true, path: mediaIndexPath(project), count: Object.keys(result.items).length });
       break;
     case "list":
-      result = listMediaItems(workspace, { sync: true });
+      result = listMediaItems(project, { sync: true });
       printList(options, result);
       break;
     case "pending":
-      result = listMediaItems(workspace, { sync: true, status: "pending" });
+      result = listMediaItems(project, { sync: true, status: "pending" });
       printList(options, result);
       break;
     case "show":
       requireArgs(args, 1, "show <mediaId>");
-      result = getMediaItem(workspace, args[0], { sync: true });
+      result = getMediaItem(project, args[0], { sync: true });
       if (!result) fail(`Media item not found: ${args[0]}`);
       print(options, result);
       break;
     case "find-telegram":
       requireOption(options, "chat-id");
       requireOption(options, "message-id");
-      result = findMediaByTelegramMessage(workspace, options["chat-id"], options["message-id"], { sync: true });
+      result = findMediaByTelegramMessage(project, options["chat-id"], options["message-id"], { sync: true });
       if (!result) fail(`Media item not found for Telegram message: ${options["chat-id"]}:${options["message-id"]}`);
       print(options, result);
       break;
@@ -56,32 +56,32 @@ try {
       requireArgs(args, 1, "describe <mediaId> (--text <description>|--stdin)");
       const description = options.stdin ? await readStdin() : options.text;
       if (description === undefined) fail("Pass --text <description> or --stdin.");
-      result = setMediaDescription(workspace, args[0], description);
+      result = setMediaDescription(project, args[0], description);
       print(options, result);
       break;
     }
     case "delete":
       requireArgs(args, 1, "delete <mediaId>");
-      result = deleteMediaItem(workspace, args[0]);
+      result = deleteMediaItem(project, args[0]);
       print(options, result);
       break;
     case "move":
       requireArgs(args, 1, "move <mediaId> --to <path>");
       requireOption(options, "to");
-      result = moveMediaItem(workspace, args[0], options.to, { overwrite: !!options.overwrite });
+      result = moveMediaItem(project, args[0], options.to, { overwrite: !!options.overwrite });
       print(options, result);
       break;
     case "send":
       requireArgs(args, 1, "send <mediaId|path>");
-      result = await sendMedia(workspace, args[0], options);
+      result = await sendMedia(project, args[0], options);
       print(options, result);
       break;
     case "sync":
-      result = syncMediaIndex(workspace);
-      print(options, { ok: true, removed: result.removed, count: Object.keys(result.index.items).length, path: mediaIndexPath(workspace) });
+      result = syncMediaIndex(project);
+      print(options, { ok: true, removed: result.removed, count: Object.keys(result.index.items).length, path: mediaIndexPath(project) });
       break;
     case "validate":
-      result = validateMediaIndex(workspace);
+      result = validateMediaIndex(project);
       print(options, result);
       if (!result.ok) process.exitCode = 1;
       break;
@@ -140,12 +140,12 @@ function print(options, value) {
   else console.log(JSON.stringify(value, null, 2));
 }
 
-async function sendMedia(workspace, target, options) {
+async function sendMedia(project, target, options) {
   const token = process.env.BOT_TOKEN || "";
   if (!token) fail("BOT_TOKEN is required. Run this from the bridge environment or keep codex-telegram-bridge/.env readable.");
 
-  const item = resolveSendItem(workspace, target, options);
-  const filePath = getMediaFilePath(workspace, item);
+  const item = resolveSendItem(project, target, options);
+  const filePath = getMediaFilePath(project, item);
   const chatId = String(options["chat-id"] || item.telegram?.chatId || firstAllowedUserId() || "").trim();
   if (!chatId) fail("Missing destination chat. Pass --chat-id <id> or set ALLOWED_USER_IDS.");
 
@@ -157,7 +157,7 @@ async function sendMedia(workspace, target, options) {
     caption: options.caption !== undefined ? options.caption : formatSendCaption(item),
     replyMarkup: mediaKeyboard(item.mediaId),
   });
-  const updated = addTelegramMessageAlias(workspace, item.mediaId, chatId, message.message_id);
+  const updated = addTelegramMessageAlias(project, item.mediaId, chatId, message.message_id);
 
   return {
     ok: true,
@@ -169,16 +169,16 @@ async function sendMedia(workspace, target, options) {
   };
 }
 
-function resolveSendItem(workspace, target, options) {
-  const existing = getMediaItem(workspace, target, { sync: true });
+function resolveSendItem(project, target, options) {
+  const existing = getMediaItem(project, target, { sync: true });
   if (existing) return existing;
 
-  const workspacePath = path.resolve(workspace);
-  const candidate = path.isAbsolute(target) ? path.resolve(target) : path.resolve(workspacePath, target);
+  const projectPath = path.resolve(project);
+  const candidate = path.isAbsolute(target) ? path.resolve(target) : path.resolve(projectPath, target);
   if (!existsSync(candidate)) fail(`Media item or file not found: ${target}`);
 
-  return upsertMediaRecord(workspacePath, createLocalMediaRecord({
-    workspace: workspacePath,
+  return upsertMediaRecord(projectPath, createLocalMediaRecord({
+    project: projectPath,
     filePath: candidate,
     caption: options.caption || "",
   })).item;
@@ -251,17 +251,17 @@ function readStdin() {
 
 function usage() {
   console.log(`Usage:
-  media-index init --workspace <path>
-  media-index list --workspace <path> [--json]
-  media-index pending --workspace <path> [--json]
-  media-index show <mediaId> --workspace <path> [--json]
-  media-index find-telegram --chat-id <id> --message-id <id> --workspace <path> [--json]
-  media-index describe <mediaId> --workspace <path> (--text <description>|--stdin) [--json]
-  media-index delete <mediaId> --workspace <path> [--json]
-  media-index move <mediaId> --workspace <path> --to <path> [--overwrite] [--json]
-  media-index send <mediaId|path> --workspace <path> [--chat-id <id>] [--caption <text>] [--json]
-  media-index sync --workspace <path> [--json]
-  media-index validate --workspace <path> [--json]`);
+  media-index init --project <path>
+  media-index list --project <path> [--json]
+  media-index pending --project <path> [--json]
+  media-index show <mediaId> --project <path> [--json]
+  media-index find-telegram --chat-id <id> --message-id <id> --project <path> [--json]
+  media-index describe <mediaId> --project <path> (--text <description>|--stdin) [--json]
+  media-index delete <mediaId> --project <path> [--json]
+  media-index move <mediaId> --project <path> --to <path> [--overwrite] [--json]
+  media-index send <mediaId|path> --project <path> [--chat-id <id>] [--caption <text>] [--json]
+  media-index sync --project <path> [--json]
+  media-index validate --project <path> [--json]`);
 }
 
 function loadDotEnv(file) {
