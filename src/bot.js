@@ -17,6 +17,7 @@ import {
 } from "./media-index.js";
 import { runMediaTriggers } from "./media-triggers.js";
 import { installBundledSkills } from "./bundled-skills.js";
+import { projectSessionStartedText } from "./project-skills.js";
 import {
   formatZonedDate,
   getScheduleTask,
@@ -256,7 +257,7 @@ async function handleCallback(query) {
       const newTarget = createTelegramProjectSession(chatId, { alias, workdir, prompt: "" });
       saveState();
       await answerCallback(query.id, "Project session started");
-      await editBridgeMessage(newTarget, query.message.message_id, `Project session started:\n${workdir}`, statusKeyboard());
+      await editBridgeMessage(newTarget, query.message.message_id, projectSessionStartedText(workdir), statusKeyboard());
     } else {
       await answerCallback(query.id, "Unknown project");
     }
@@ -1125,7 +1126,7 @@ async function handleProjectCommand(target, session, projectCommand) {
   saveState();
 
   if (!projectCommand.prompt) {
-    await sendBridgeMessage(target, `Project session started:\n${projectCommand.workdir}`);
+    await sendBridgeMessage(target, projectSessionStartedText(projectCommand.workdir));
     return;
   }
 

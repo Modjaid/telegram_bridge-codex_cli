@@ -25,6 +25,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 - Projects are configured only in `.env`: `PROJECT_ALLOWLIST` is the comma-separated list of allowed absolute paths, and `PROJECT_COMMANDS` maps slash aliases to paths from that allowlist.
 - Telegram project create/attach/delete must go through `scripts/project-manager`; do not hand-edit `.env` for that flow. Created or attached projects must include an `AGENTS.md` file. Deleting a project recursively removes its folder and is restricted to paths inside `PROJECT_CREATE_ROOT`.
 - Telegram session key is global (`telegram`), so project switches/reset affect the whole Telegram bridge session.
+- Project-switch confirmation messages list the selected project's local skills from `.codex/skills/*/SKILL.md`.
 - Telegram media is downloaded once into the shared seven-day XDG cache (`$XDG_CACHE_HOME/codex-telegram-bridge/telegram-media`, or `~/.cache/...`; override with `TELEGRAM_MEDIA_CACHE_ROOT`). Project-specific processing belongs in `.codex/skills/*/telegram-media-trigger.json` plus that skill's scripts; reply resolution must never rerun triggers or STT.
 - Register persistent project artifacts with `scripts/media-event complete`; do not hand-edit the shared `.media-index.json`.
 - Keep bundled skill `VERSION` files in sync with material skill changes; startup must preserve an installed version newer than the bundle.
