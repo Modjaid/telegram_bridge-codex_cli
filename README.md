@@ -133,7 +133,8 @@ You can also connect CollabMD, a convenient tool for working with Markdown files
 Telegram media is downloaded once into the shared cache configured by:
 
 ```bash
-TELEGRAM_MEDIA_CACHE_ROOT=/home/agent/media_files/telegram-cache
+# Optional; defaults to $XDG_CACHE_HOME/codex-telegram-bridge/telegram-media
+TELEGRAM_MEDIA_CACHE_ROOT=
 TELEGRAM_MEDIA_CACHE_TTL_DAYS=7
 TELEGRAM_MEDIA_TRIGGER_TIMEOUT_MS=120000
 ```
@@ -176,13 +177,13 @@ Telegram photo/image, audio/voice, video, animation, video note, and document up
 The uploaded file content is stored as a normal file:
 
 ```text
-/home/agent/media_files/telegram-cache/files/<cache-entry-id>/<telegram-file-name>
+$XDG_CACHE_HOME/codex-telegram-bridge/telegram-media/files/<cache-entry-id>/<telegram-file-name>
 ```
 
 Metadata is stored separately from the file content in the media index:
 
 ```text
-/home/agent/media_files/telegram-cache/.media-index.json
+$XDG_CACHE_HOME/codex-telegram-bridge/telegram-media/.media-index.json
 ```
 
 The index stores `mediaId`, the source project, Telegram message aliases, file metadata, trigger results, registered project artifacts, and expiration time. The original Telegram message and the Bridge echo message resolve to the same record.

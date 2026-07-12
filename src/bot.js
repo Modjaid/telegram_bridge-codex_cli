@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs";
 import http from "node:http";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import {
   addTelegramMessageAlias,
@@ -57,7 +57,7 @@ const config = {
   sttTimeoutMs: Number(process.env.STT_TIMEOUT_MS || 120000),
   maxAudioBytes: Number(process.env.MAX_AUDIO_BYTES || 20000000),
   maxInboxFileBytes: Number(process.env.MAX_INBOX_FILE_BYTES || 50000000),
-  mediaCacheRoot: path.resolve(process.env.TELEGRAM_MEDIA_CACHE_ROOT || "/home/agent/media_files/telegram-cache"),
+  mediaCacheRoot: resolveMediaCacheRoot(),
   mediaCacheTtlDays: Number(process.env.TELEGRAM_MEDIA_CACHE_TTL_DAYS || 7),
   mediaTriggerTimeoutMs: Number(process.env.TELEGRAM_MEDIA_TRIGGER_TIMEOUT_MS || 120000),
   jsonUploadDir: path.resolve(process.env.JSON_UPLOAD_DIR || path.join(tmpdir(), "codex-telegram-upload")),
@@ -87,6 +87,7 @@ for (const project of config.projects) {
 }
 config.projectCommands = parseProjectCommandSpec(config.projectCommandSpec, config.projects);
 config.projectCreateRoot = path.resolve(process.env.PROJECT_CREATE_ROOT || inferProjectCreateRoot(config.projects));
+migrateLegacyMediaCache(config.mediaCacheRoot);
 mkdirSync(path.join(config.mediaCacheRoot, "files"), { recursive: true, mode: 0o700 });
 cleanupMediaCache();
 setInterval(cleanupMediaCache, 24 * 60 * 60 * 1000).unref();
@@ -485,7 +486,7 @@ async function handleMessage(message) {
     }
   }
   if (!replyInboxContext && inboxRecord) {
-    replyInboxContext = { record: inboxRecord, path: resolvedReplyMediaPath(inboxRecord) };
+    replyInboxContext = { kind: "attachment", record: inboxRecord, path: resolvedReplyMediaPath(inboxRecord) };
   }
 
   appendHistory(session, {
@@ -2034,10 +2035,12 @@ function buildTextPrompt(text, replyInboxContext = null) {
 function formatReplyInboxPromptSection(replyInboxContext = null) {
   if (!replyInboxContext) return "";
   return [
-    "Telegram reply media:",
+    replyInboxContext.kind === "attachment" ? "Telegram attached media:" : "Telegram reply media:",
     formatSavedInboxMessage(replyInboxContext.record, replyInboxContext.path),
     replyInboxContext.record?.sourceProject?.alias ? `source project: ${replyInboxContext.record.sourceProject.alias}` : "",
-    replyInboxContext.record?.transcription?.text ? `saved transcript:\n${replyInboxContext.record.transcription.text}` : "",
+    replyInboxContext.kind !== "attachment" && replyInboxContext.record?.transcription?.text
+      ? `saved transcript:\n${replyInboxContext.record.transcription.text}`
+      : "",
   ].filter(Boolean).join("\n");
 }
 
@@ -2275,7 +2278,7 @@ async function handleAudioMessage(target, session, audio, inboxPath = "", inboxR
       const audioPrompt = options.userText && options.userText !== transcript
         ? `Telegram caption:\n${options.userText}\n\nAudio transcript:\n${transcript}`
         : transcript;
-      await runCodex(target, buildTextPrompt(audioPrompt, inboxRecord ? { record: inboxRecord, path: resolvedReplyMediaPath(inboxRecord) } : null), {
+      await runCodex(target, buildTextPrompt(audioPrompt, inboxRecord ? { kind: "attachment", record: inboxRecord, path: resolvedReplyMediaPath(inboxRecord) } : null), {
         liveHeader,
         liveMessageId: progress.message_id,
       });
@@ -2876,6 +2879,26 @@ function loadDotEnv(file) {
     const [, key, rawValue] = match;
     if (process.env[key] !== undefined) continue;
     process.env[key] = rawValue.replace(/^["']|["']$/g, "");
+  }
+}
+
+function resolveMediaCacheRoot() {
+  const xdgCacheHome = process.env.XDG_CACHE_HOME
+    ? path.resolve(process.env.XDG_CACHE_HOME)
+    : path.join(homedir(), ".cache");
+  return path.resolve(process.env.TELEGRAM_MEDIA_CACHE_ROOT || path.join(xdgCacheHome, "codex-telegram-bridge", "telegram-media"));
+}
+
+function migrateLegacyMediaCache(target) {
+  if (process.env.TELEGRAM_MEDIA_CACHE_ROOT || existsSync(target)) return;
+  const legacy = path.join(homedir(), "media_files", "telegram-cache");
+  if (!existsSync(legacy)) return;
+  try {
+    mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    renameSync(legacy, target);
+    console.log(`Migrated Telegram media cache: ${legacy} -> ${target}`);
+  } catch (error) {
+    console.warn(`Telegram media cache migration failed: ${error.message}`);
   }
 }
 

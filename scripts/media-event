@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { getMediaItem, listMediaItems, upsertMediaRecord, validateMediaIndex } from "../src/media-index.js";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 loadDotEnv(path.join(ROOT, ".env"));
-const cacheRoot = path.resolve(process.env.TELEGRAM_MEDIA_CACHE_ROOT || "/home/agent/media_files/telegram-cache");
+const xdgCacheHome = process.env.XDG_CACHE_HOME ? path.resolve(process.env.XDG_CACHE_HOME) : path.join(homedir(), ".cache");
+const cacheRoot = path.resolve(process.env.TELEGRAM_MEDIA_CACHE_ROOT || path.join(xdgCacheHome, "codex-telegram-bridge", "telegram-media"));
 const [command, ...tokens] = process.argv.slice(2);
 const args = parseArgs(tokens);
 
