@@ -128,63 +128,77 @@ schedule-task delete --chat-id <id> --name <task-name-or-id>
 
 You can also connect CollabMD, a convenient tool for working with Markdown files on a VPS.
 
-## Inbox And File Handling
+## Shared Media Cache And Project Triggers
 
-Telegram photo/image, audio/voice, video, animation, video note, and document uploads are saved into `Inbox` under the current Telegram project. The bridge creates the folder when it does not exist. Use `MAX_INBOX_FILE_BYTES` to adjust the per-file download limit.
+Telegram media is downloaded once into the shared cache configured by:
+
+```bash
+TELEGRAM_MEDIA_CACHE_ROOT=/home/agent/media_files/telegram-cache
+TELEGRAM_MEDIA_CACHE_TTL_DAYS=7
+TELEGRAM_MEDIA_TRIGGER_TIMEOUT_MS=120000
+```
+
+Project-specific handlers live in project-local Codex skills:
+
+```text
+<project>/.codex/skills/<skill>/
+├── SKILL.md
+├── telegram-media-trigger.json
+└── scripts/handle-media.js
+```
+
+Example trigger manifest:
+
+```json
+{
+  "version": 1,
+  "subscriptions": [{
+    "id": "documents",
+    "projects": ["agent", "memomaker"],
+    "match": { "extensions": [".pdf", ".apk"] },
+    "run": "scripts/handle-media.js"
+  }, {
+    "id": "fallback",
+    "projects": ["*"],
+    "match": { "all": true },
+    "fallback": true,
+    "run": "scripts/handle-media.js"
+  }]
+}
+```
+
+The handler receives JSON on stdin and returns JSON on stdout. Returned `artifacts` must exist inside the source project. Use `media-event complete --media-id <id> --project <alias> --path <relative-path>` when an agent creates or moves an artifact manually.
+
+Caption text is sent to Codex in the project active when the file arrived. Voice/audio follows both paths: the original file runs matching media triggers while STT sends its transcript to Codex. Replying to a media message never reruns triggers or STT; Bridge resolves an existing project artifact first, then the shared cache. Cache files older than seven days are removed at startup and daily.
+
+Telegram photo/image, audio/voice, video, animation, video note, and document uploads are cached centrally. Use `MAX_INBOX_FILE_BYTES` to adjust the per-file download limit.
 
 The uploaded file content is stored as a normal file:
 
 ```text
-<project>/Inbox/<telegram-file-name>
+/home/agent/media_files/telegram-cache/files/<cache-entry-id>/<telegram-file-name>
 ```
-
-If a file with the same name already exists, the bridge writes a unique filename instead of overwriting the old file.
 
 Metadata is stored separately from the file content in the media index:
 
 ```text
-<project>/Inbox/.media-index.json
+/home/agent/media_files/telegram-cache/.media-index.json
 ```
 
-The index stores the bridge `mediaId`, Telegram chat/message/file ids, media type, MIME type, local path, size, SHA-256, caption, creation/save dates, and an agent-editable description field. Missing local files are pruned synchronously when the bridge or helper commands update the index.
+The index stores `mediaId`, the source project, Telegram message aliases, file metadata, trigger results, registered project artifacts, and expiration time. The original Telegram message and the Bridge echo message resolve to the same record.
 
-After saving an upload, the bridge sends the file back to Telegram with inline `Info` and `Delete` controls. That echo message is also linked to the same `mediaId`, so a later Telegram reply to the original upload or to the echo can be resolved back to the local Inbox file.
+After saving a non-voice upload, Bridge sends the file back with `Info` and `Delete` controls. A later reply resolves an existing project artifact first and the cache original second. It does not run handlers again.
 
-When a user replies to an Inbox media message with a Codex command, the bridge adds a `Telegram reply media` block to the Codex prompt. That block contains the local path, `mediaId`, index path, file type, MIME type, size, SHA-256, caption, and description status, so Codex can inspect or move the saved file from the project.
-
-Telegram `.json` document uploads are also copied into `JSON_UPLOAD_DIR` (`/tmp/codex-telegram-upload` by default). They are sent to Codex only when the caption contains a bridge command, for example:
-
-```text
-/codex inspect this snapshot
-```
-
-Optional JSON upload settings:
+Codex runs launched by Bridge get `scripts/` on `PATH`, so agents can inspect and register media events:
 
 ```bash
-JSON_UPLOAD_DIR=/tmp/codex-telegram-upload
-MAX_JSON_BYTES=10000000
+media-event list
+media-event show --media-id <mediaId>
+media-event complete --media-id <mediaId> --project <alias> --path <project-relative-path>
+media-event validate
 ```
 
-Codex runs launched by the bridge get `scripts/` prepended to `PATH`, so agents can use the media helper from any project:
-
-```bash
-media-index list --project .
-media-index pending --project .
-media-index show <mediaId> --project . --json
-media-index find-telegram --chat-id <id> --message-id <id> --project . --json
-printf '%s\n' 'description text' | media-index describe <mediaId> --project . --stdin
-media-index move <mediaId> --project . --to Archive/2026/file.jpg
-media-index delete <mediaId> --project .
-media-index send <mediaId|path> --project .
-media-index sync --project .
-media-index validate --project .
-```
-
-Use `media-index describe` instead of editing `.media-index.json` by hand. The helper takes the same lock as the bridge, verifies that referenced files still exist, preserves existing descriptions during bridge upserts, and writes the index atomically.
-
-Use `media-index send` when Codex finds a relevant local file and should forward it back to the Telegram user. The argument can be an indexed `mediaId` or a file path inside the project. A path is first added to the media index as a local media item, then sent with the same inline `Info` and `Delete` controls as Inbox uploads. By default the destination is the media item's Telegram chat when present, otherwise the first `ALLOWED_USER_IDS` entry; pass `--chat-id <id>` to override it.
-
-Voice and audio messages can be transcribed and saved into dialog history. Telegram voice messages recorded directly in chat are treated as user prompts: the bridge transcribes them, sends the transcript to Codex, and keeps the transcript in the same live progress message. Uploaded audio files are saved as media and only sent to Codex when the transcript contains a bridge command, or when Codex is waiting for an explicit answer. Enable local STT in `.env`:
+Voice and audio messages use the same cached original for both media triggers and STT. Voice transcripts remain direct user prompts; an uploaded audio caption is combined with its transcript. Enable local STT in `.env`:
 
 ```bash
 STT_COMMAND=scripts/transcribe-faster-whisper

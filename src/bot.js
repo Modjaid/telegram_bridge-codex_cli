@@ -8,12 +8,14 @@ import {
   addTelegramMessageAlias,
   createTelegramMediaRecord,
   deleteMediaItem,
-  findMediaProject,
+  expireMediaItem,
   getMediaItem,
+  listMediaItems,
   MEDIA_INDEX_RELATIVE_PATH,
   peekMediaByTelegramMessage,
   upsertMediaRecord,
 } from "./media-index.js";
+import { runMediaTriggers } from "./media-triggers.js";
 import {
   formatZonedDate,
   getScheduleTask,
@@ -55,6 +57,9 @@ const config = {
   sttTimeoutMs: Number(process.env.STT_TIMEOUT_MS || 120000),
   maxAudioBytes: Number(process.env.MAX_AUDIO_BYTES || 20000000),
   maxInboxFileBytes: Number(process.env.MAX_INBOX_FILE_BYTES || 50000000),
+  mediaCacheRoot: path.resolve(process.env.TELEGRAM_MEDIA_CACHE_ROOT || "/home/agent/media_files/telegram-cache"),
+  mediaCacheTtlDays: Number(process.env.TELEGRAM_MEDIA_CACHE_TTL_DAYS || 7),
+  mediaTriggerTimeoutMs: Number(process.env.TELEGRAM_MEDIA_TRIGGER_TIMEOUT_MS || 120000),
   jsonUploadDir: path.resolve(process.env.JSON_UPLOAD_DIR || path.join(tmpdir(), "codex-telegram-upload")),
   maxJsonBytes: Number(process.env.MAX_JSON_BYTES || 10000000),
   bridgeCommands: csv(process.env.BRIDGE_COMMANDS || "/codex,@codex,codex:"),
@@ -82,6 +87,9 @@ for (const project of config.projects) {
 }
 config.projectCommands = parseProjectCommandSpec(config.projectCommandSpec, config.projects);
 config.projectCreateRoot = path.resolve(process.env.PROJECT_CREATE_ROOT || inferProjectCreateRoot(config.projects));
+mkdirSync(path.join(config.mediaCacheRoot, "files"), { recursive: true, mode: 0o700 });
+cleanupMediaCache();
+setInterval(cleanupMediaCache, 24 * 60 * 60 * 1000).unref();
 
 const apiBase = config.botToken ? `https://api.telegram.org/bot${config.botToken}` : "";
 const state = loadState();
@@ -304,7 +312,8 @@ async function handleMediaCallback(query, data) {
   }
 
   try {
-    const found = findMediaProject(config.projects, mediaId);
+    const cachedItem = getMediaItem(config.mediaCacheRoot, mediaId, { sync: false });
+    const found = cachedItem ? { project: cachedItem.sourceProject?.path || config.mediaCacheRoot, item: cachedItem } : null;
     console.log(`media callback lookup: action=${action || ""} mediaId=${mediaId} found=${found ? "yes" : "no"} project=${found?.project || ""}`);
     if (action === "info") {
       if (!found) {
@@ -326,7 +335,7 @@ async function handleMediaCallback(query, data) {
         await editMediaCallbackMessage(query.message, `File already removed from storage:\n${mediaId}`, undefined);
         return;
       }
-      const result = deleteMediaItem(found.project, mediaId);
+      const result = deleteMediaItem(config.mediaCacheRoot, mediaId);
       console.log(`media delete result: mediaId=${mediaId} project=${found.project} deleted=${result.deleted} fileDeleted=${result.fileDeleted} file=${result.filePath || ""}`);
       await answerCallback(query.id, result.deleted ? "Deleted" : "Already removed");
       await editMediaCallbackMessage(query.message, [
@@ -359,11 +368,11 @@ async function handleMessage(message) {
     return;
   }
 
-  const text = (message.text || "").trim();
+  const text = (message.text || message.caption || "").trim();
   const audio = getAudioAttachment(message);
   const jsonDocument = getJsonDocumentAttachment(message);
   const voicePrompt = Boolean(message.voice?.file_id);
-  const inboxAttachment = voicePrompt ? null : getInboxAttachment(message);
+  const inboxAttachment = getInboxAttachment(message);
   if (!text && !audio && !jsonDocument && !inboxAttachment) return;
 
   if (text && await handlePendingProjectCreateReply(message, text)) return;
@@ -424,22 +433,25 @@ async function handleMessage(message) {
     try {
       inboxPath = await saveInboxAttachment(session, inboxAttachment);
       inboxRecord = recordInboxMedia(session, message, inboxAttachment, inboxPath);
+      inboxRecord = await processMediaTriggers(session, inboxRecord);
       bindTelegramMessageToSession(target, message.message_id);
     } catch (error) {
-      await sendBridgeMessage(target, `Failed to save media to Inbox: ${error.message}`);
+      await sendBridgeMessage(target, `Failed to cache media: ${error.message}`);
       return;
     }
     try {
-      const echoMessage = await sendInboxMediaMessage(target, inboxRecord);
-      recordInboxEchoMessage(session, inboxRecord, echoMessage);
-      bindTelegramMessageToSession(target, echoMessage?.message_id);
-      inboxEchoSent = true;
+      if (!voicePrompt) {
+        const echoMessage = await sendInboxMediaMessage(target, inboxRecord);
+        recordInboxEchoMessage(session, inboxRecord, echoMessage);
+        bindTelegramMessageToSession(target, echoMessage?.message_id);
+        inboxEchoSent = true;
+      }
     } catch (error) {
-      await sendBridgeMessage(target, `Saved to Inbox, but failed to send media controls: ${error.message}\n\n${formatSavedInboxMessage(inboxRecord, inboxPath)}`);
+      await sendBridgeMessage(target, `Media cached, but controls could not be sent: ${error.message}\n\n${formatSavedInboxMessage(inboxRecord, inboxPath)}`);
     }
   }
   if (audio) {
-    await handleAudioMessage(target, session, audio, inboxPath, inboxRecord, { runAsPrompt: voicePrompt });
+    await handleAudioMessage(target, session, audio, inboxPath, inboxRecord, { runAsPrompt: voicePrompt || Boolean(text), userText: text });
     return;
   }
   if (jsonDocument) {
@@ -471,6 +483,9 @@ async function handleMessage(message) {
       await sendBridgeMessage(target, `Файл из reply не найден в Inbox: ${error.message}`);
       return;
     }
+  }
+  if (!replyInboxContext && inboxRecord) {
+    replyInboxContext = { record: inboxRecord, path: resolvedReplyMediaPath(inboxRecord) };
   }
 
   appendHistory(session, {
@@ -2021,7 +2036,9 @@ function formatReplyInboxPromptSection(replyInboxContext = null) {
   return [
     "Telegram reply media:",
     formatSavedInboxMessage(replyInboxContext.record, replyInboxContext.path),
-  ].join("\n");
+    replyInboxContext.record?.sourceProject?.alias ? `source project: ${replyInboxContext.record.sourceProject.alias}` : "",
+    replyInboxContext.record?.transcription?.text ? `saved transcript:\n${replyInboxContext.record.transcription.text}` : "",
+  ].filter(Boolean).join("\n");
 }
 
 function stripBridgePrefix(text) {
@@ -2214,7 +2231,7 @@ async function handleAudioMessage(target, session, audio, inboxPath = "", inboxR
   let tempDir = "";
   try {
     tempDir = mkdtempSync(path.join(tmpdir(), "codex-telegram-audio-"));
-    const sourcePath = await downloadTelegramFile(audio.fileId, tempDir, audio.fileName, {
+    const sourcePath = inboxPath || await downloadTelegramFile(audio.fileId, tempDir, audio.fileName, {
       maxBytes: config.maxAudioBytes,
       label: "audio",
     });
@@ -2227,6 +2244,10 @@ async function handleAudioMessage(target, session, audio, inboxPath = "", inboxR
     if (!transcript) {
       await editBridgeMessage(target, progress.message_id, "STT returned an empty transcript.", undefined);
       return;
+    }
+    if (inboxRecord) {
+      inboxRecord.transcription = { status: "completed", text: transcript, updatedAt: new Date().toISOString() };
+      upsertMediaRecord(config.mediaCacheRoot, inboxRecord);
     }
 
     appendHistory(session, {
@@ -2251,7 +2272,10 @@ async function handleAudioMessage(target, session, audio, inboxPath = "", inboxR
       return;
     }
     if (options.runAsPrompt) {
-      await runCodex(target, buildTextPrompt(transcript), {
+      const audioPrompt = options.userText && options.userText !== transcript
+        ? `Telegram caption:\n${options.userText}\n\nAudio transcript:\n${transcript}`
+        : transcript;
+      await runCodex(target, buildTextPrompt(audioPrompt, inboxRecord ? { record: inboxRecord, path: resolvedReplyMediaPath(inboxRecord) } : null), {
         liveHeader,
         liveMessageId: progress.message_id,
       });
@@ -2285,16 +2309,17 @@ async function handleJsonDocumentMessage(target, session, document, caption, inb
     return;
   }
 
-  const progress = await sendBridgeMessage(target, "Downloading JSON file...");
+  const progress = await sendBridgeMessage(target, "Preparing JSON file...");
   try {
     mkdirSync(config.jsonUploadDir, { recursive: true, mode: 0o700 });
-    const uploadPath = await downloadTelegramFile(document.fileId, config.jsonUploadDir, document.fileName, {
+    const uploadPath = inboxPath || await downloadTelegramFile(document.fileId, config.jsonUploadDir, document.fileName, {
       maxBytes: config.maxJsonBytes,
       label: "JSON file",
     });
+    const effectivePath = inboxRecord ? resolvedReplyMediaPath(inboxRecord) : uploadPath;
     const prompt = [
       "User uploaded JSON file:",
-      uploadPath,
+      effectivePath,
       inboxPath ? formatSavedInboxMessage(inboxRecord, inboxPath) : "",
       caption.trim() ? `Caption:\n${caption.trim()}` : "",
     ].filter(Boolean).join("\n");
@@ -2319,7 +2344,8 @@ async function handleJsonDocumentMessage(target, session, document, caption, inb
     }
     const bridgeCommand = parseBridgeCommand(caption || "");
     if (bridgeCommand) await runCodex(target, buildPrompt(session, bridgeCommand, prompt));
-    else await sendBridgeMessage(target, `JSON saved at:\n${uploadPath}${inboxPath ? `\n\n${formatSavedInboxMessage(inboxRecord, inboxPath)}` : ""}\n\nAdd a ${config.bridgeCommands[0]} caption to send it to Codex.`);
+    else if (caption.trim()) await runCodex(target, buildTextPrompt(prompt));
+    else await sendBridgeMessage(target, `JSON cached at:\n${uploadPath}`);
   } catch (error) {
     await editBridgeMessage(target, progress.message_id, `JSON file download failed: ${error.message}`, undefined).catch(() => {});
   }
@@ -2431,10 +2457,9 @@ async function saveInboxAttachment(session, attachment) {
     throw new Error(`${attachment.mediaType} is too large: ${attachment.fileSize} bytes. Limit: ${config.maxInboxFileBytes} bytes.`);
   }
 
-  const workdir = session.workdir || config.projects[0];
-  const inboxDir = path.join(workdir, "Inbox");
-  mkdirSync(inboxDir, { recursive: true, mode: 0o700 });
-  return downloadTelegramFile(attachment.fileId, inboxDir, attachment.fileName, {
+  const cacheDir = path.join(config.mediaCacheRoot, "files", randomUUID());
+  mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+  return downloadTelegramFile(attachment.fileId, cacheDir, attachment.fileName, {
     maxBytes: config.maxInboxFileBytes,
     label: attachment.mediaType,
     unique: true,
@@ -2444,12 +2469,39 @@ async function saveInboxAttachment(session, attachment) {
 function recordInboxMedia(session, message, attachment, inboxPath) {
   const project = session.workdir || config.projects[0];
   const record = createTelegramMediaRecord({
-    project,
+    project: config.mediaCacheRoot,
     message,
     attachment,
     filePath: inboxPath,
   });
-  return upsertMediaRecord(project, record).item;
+  record.sourceProject = { alias: projectAliasForPath(project), path: project };
+  record.expiresAt = new Date(Date.now() + config.mediaCacheTtlDays * 86400000).toISOString();
+  record.triggerResults = [];
+  return upsertMediaRecord(config.mediaCacheRoot, record).item;
+}
+
+async function processMediaTriggers(session, record) {
+  const projectPath = session.workdir || config.projects[0];
+  const projects = config.projects.map(project => ({ alias: projectAliasForPath(project), path: project }));
+  const results = await runMediaTriggers({
+    projects,
+    sourceProject: { alias: projectAliasForPath(projectPath), path: projectPath },
+    record,
+    timeoutMs: config.mediaTriggerTimeoutMs,
+  });
+  record.triggerResults = results.map(item => normalizeTriggerResult(item, projectPath));
+  return upsertMediaRecord(config.mediaCacheRoot, record).item;
+}
+
+function normalizeTriggerResult(item, projectPath) {
+  const result = item.result && typeof item.result === "object" ? { ...item.result } : {};
+  result.artifacts = (Array.isArray(result.artifacts) ? result.artifacts : []).flatMap(artifact => {
+    const candidate = path.resolve(projectPath, String(artifact?.path || ""));
+    const relative = path.relative(projectPath, candidate);
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative) || !existsSync(candidate)) return [];
+    return [{ ...artifact, path: candidate }];
+  });
+  return { ...item, result };
 }
 
 function recordInboxEchoMessage(session, record, echoMessage) {
@@ -2457,8 +2509,7 @@ function recordInboxEchoMessage(session, record, echoMessage) {
   const chatId = echoMessage?.chat?.id || record?.telegram?.chatId || "";
   if (!record?.mediaId || !messageId) return;
 
-  const project = session.workdir || config.projects[0];
-  addTelegramMessageAlias(project, record.mediaId, chatId, messageId);
+  addTelegramMessageAlias(config.mediaCacheRoot, record.mediaId, chatId, messageId);
 }
 
 async function getReplyInboxContext(session, message) {
@@ -2469,36 +2520,33 @@ async function getReplyInboxContext(session, message) {
     ...reply,
     chat: reply.chat || message.chat,
   };
-  const project = session.workdir || config.projects[0];
-  const found = findReplyMediaRecord(project, replyMessage)
-    || findReplyMediaRecordInOtherProjects(project, replyMessage);
+  const found = findReplyMediaRecord(config.mediaCacheRoot, replyMessage) || findLegacyReplyMediaRecord(replyMessage);
   if (!found) {
     if (!getInboxAttachment(replyMessage) && !parseMediaId(replyMessage.caption || replyMessage.text || "")) return null;
     throw new Error("запись для этого Telegram-сообщения отсутствует");
   }
 
-  const inboxPath = mediaRecordFilePath(found.project, found.item);
+  const inboxPath = resolvedReplyMediaPath(found.item, found.project);
   if (!inboxPath || !existsSync(inboxPath)) {
+    if (found.item.file?.expiredAt) throw new Error("файл удалён из недельного кэша и не был сохранён проектом; отправьте его повторно");
     throw new Error(found.item.file?.relativePath || found.item.file?.path || "локальный файл отсутствует");
   }
 
   return { record: found.item, path: inboxPath };
 }
 
-function findReplyMediaRecordInOtherProjects(currentProject, message) {
-  const current = path.resolve(currentProject);
-  for (const project of config.projects) {
-    if (path.resolve(project) === current) continue;
-    const found = findReplyMediaRecord(project, message);
-    if (found) return found;
-  }
-  return null;
-}
-
 function findReplyMediaRecord(project, message) {
   const item = peekMediaByTelegramMessage(project, message.chat.id, message.message_id)
     || getReplyMediaByCaption(project, message);
   return item ? { project, item } : null;
+}
+
+function findLegacyReplyMediaRecord(message) {
+  for (const project of config.projects) {
+    const found = findReplyMediaRecord(project, message);
+    if (found) return found;
+  }
+  return null;
 }
 
 function getReplyMediaByCaption(project, message) {
@@ -2509,6 +2557,15 @@ function getReplyMediaByCaption(project, message) {
   } catch {
     return null;
   }
+}
+
+function resolvedReplyMediaPath(item, recordRoot = config.mediaCacheRoot) {
+  for (const trigger of item.triggerResults || []) {
+    for (const artifact of trigger.result?.artifacts || []) {
+      if (artifact.path && existsSync(artifact.path)) return artifact.path;
+    }
+  }
+  return mediaRecordFilePath(recordRoot, item);
 }
 
 function parseMediaId(text) {
@@ -2524,17 +2581,17 @@ function mediaRecordFilePath(project, item) {
 
 function formatSavedInboxMessage(record, inboxPath) {
   return [
-    "Saved to Inbox:",
+    "Cached Telegram media:",
     inboxPath,
     record?.mediaId ? `mediaId: ${record.mediaId}` : "",
-    `index: ${path.join(record ? path.dirname(path.dirname(record.file.path)) : path.dirname(path.dirname(inboxPath)), MEDIA_INDEX_RELATIVE_PATH)}`,
+    `index: ${path.join(config.mediaCacheRoot, MEDIA_INDEX_RELATIVE_PATH)}`,
     record?.descriptionStatus ? `description: ${record.descriptionStatus}` : "description: pending",
   ].filter(Boolean).join("\n");
 }
 
 function formatInboxMediaCaption(record) {
   return [
-    "Saved to Inbox",
+    "Cached Telegram media",
     `mediaId: ${record.mediaId}`,
     `type: ${record.file?.mediaType || "file"}`,
     `file: ${record.file?.relativePath || record.file?.path || ""}`,
@@ -2563,6 +2620,18 @@ function formatMediaInfo(project, item) {
     item.telegram?.caption ? `caption: ${item.telegram.caption}` : "",
     item.description ? `description text: ${item.description}` : "",
   ].filter(Boolean).join("\n");
+}
+
+function cleanupMediaCache() {
+  try {
+    const cutoff = Date.now() - config.mediaCacheTtlDays * 86400000;
+    for (const item of listMediaItems(config.mediaCacheRoot, { sync: false })) {
+      const timestamp = Date.parse(item.savedAt || item.createdAt || "");
+      if (Number.isFinite(timestamp) && timestamp < cutoff && !item.file?.expiredAt) expireMediaItem(config.mediaCacheRoot, item.mediaId);
+    }
+  } catch (error) {
+    console.warn(`Media cache cleanup failed: ${error.message}`);
+  }
 }
 
 function getAudioAttachment(message) {

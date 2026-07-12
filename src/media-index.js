@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 
-export const MEDIA_INDEX_RELATIVE_PATH = path.join("Inbox", ".media-index.json");
+export const MEDIA_INDEX_RELATIVE_PATH = ".media-index.json";
 const INDEX_VERSION = 1;
 const LOCK_TIMEOUT_MS = 10000;
 const STALE_LOCK_MS = 30000;
@@ -181,7 +181,7 @@ export function getMediaItem(project, mediaId, options = {}) {
   const index = loadMediaIndex(project, { sync: options.sync !== false });
   const item = index.items[mediaId];
   if (!item) return null;
-  assertItemFileExists(project, item);
+  if (!item.file?.expiredAt) assertItemFileExists(project, item);
   return item;
 }
 
@@ -190,7 +190,7 @@ export function findMediaByTelegramMessage(project, chatId, messageId, options =
   const mediaId = index.telegramMessageIndex[telegramMessageKey(chatId, messageId)];
   if (!mediaId) return null;
   const item = index.items[mediaId] || null;
-  if (item) assertItemFileExists(project, item);
+  if (item && !item.file?.expiredAt) assertItemFileExists(project, item);
   return item;
 }
 
@@ -215,10 +215,32 @@ export function syncMediaIndex(project = process.cwd()) {
   });
 }
 
+export function expireMediaItem(project, mediaId) {
+  return withMediaIndexLock(project, () => {
+    const index = loadMediaIndexUnlocked(project);
+    const item = index.items[mediaId];
+    if (!item) return { expired: false, fileDeleted: false };
+    let fileDeleted = false;
+    try {
+      const filePath = itemAbsolutePath(project, item);
+      if (existsSync(filePath)) {
+        unlinkSync(filePath);
+        fileDeleted = true;
+      }
+    } catch {}
+    item.file ||= {};
+    item.file.expiredAt = nowIso();
+    index.updatedAt = nowIso();
+    saveMediaIndexUnlocked(project, index);
+    return { expired: true, fileDeleted, item };
+  });
+}
+
 export function validateMediaIndex(project = process.cwd()) {
   const index = loadMediaIndexUnlocked(project);
   const missing = [];
   for (const item of Object.values(index.items)) {
+    if (item.file?.expiredAt) continue;
     if (!itemFileExists(project, item)) missing.push(item.mediaId);
   }
   return { ok: missing.length === 0, missing, count: Object.keys(index.items).length };
@@ -414,6 +436,7 @@ function normalizeRelatedMessageIds(value) {
 
 function assertRecordFile(project, record) {
   if (!record?.mediaId) throw new Error("Media record is missing mediaId");
+  if (record.file?.expiredAt) return;
   assertItemFileExists(project, record);
 }
 

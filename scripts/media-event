@@ -1,0 +1,72 @@
+#!/usr/bin/env node
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { getMediaItem, listMediaItems, upsertMediaRecord, validateMediaIndex } from "../src/media-index.js";
+
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+loadDotEnv(path.join(ROOT, ".env"));
+const cacheRoot = path.resolve(process.env.TELEGRAM_MEDIA_CACHE_ROOT || "/home/agent/media_files/telegram-cache");
+const [command, ...tokens] = process.argv.slice(2);
+const args = parseArgs(tokens);
+
+try {
+  if (command === "list") print(listMediaItems(cacheRoot, { sync: false }));
+  else if (command === "show") print(requiredItem(args));
+  else if (command === "complete") print(complete(args));
+  else if (command === "validate") print(validateMediaIndex(cacheRoot));
+  else help();
+} catch (error) {
+  console.error(error.message);
+  process.exitCode = 1;
+}
+
+function requiredItem(options) {
+  const mediaId = required(options, "media-id");
+  const item = getMediaItem(cacheRoot, mediaId, { sync: false });
+  if (!item) throw new Error(`Media event not found: ${mediaId}`);
+  return item;
+}
+
+function complete(options) {
+  const item = requiredItem(options);
+  const alias = required(options, "project");
+  const project = projectPath(alias);
+  const artifactPath = path.resolve(project, required(options, "path"));
+  const relative = path.relative(project, artifactPath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Artifact must be inside the selected project");
+  if (!existsSync(artifactPath)) throw new Error(`Artifact does not exist: ${artifactPath}`);
+  item.triggerResults ||= [];
+  item.triggerResults.push({
+    ownerProject: alias,
+    skill: "manual",
+    subscriptionId: "media-event-complete",
+    ok: true,
+    result: { status: "processed", artifacts: [{ mediaId: item.mediaId, path: artifactPath }] },
+  });
+  return upsertMediaRecord(cacheRoot, item).item;
+}
+
+function projectPath(alias) {
+  const spec = String(process.env.PROJECT_COMMANDS || "").split(",");
+  for (const entry of spec) {
+    const [name, ...rest] = entry.split("=");
+    if (name?.replace(/^\//, "") === alias) return path.resolve(rest.join("="));
+  }
+  throw new Error(`Unknown project: ${alias}`);
+}
+
+function parseArgs(values) {
+  const result = {};
+  for (let i = 0; i < values.length; i += 2) result[String(values[i] || "").replace(/^--/, "")] = values[i + 1];
+  return result;
+}
+function required(object, key) { if (!object[key]) throw new Error(`--${key} is required`); return object[key]; }
+function print(value) { console.log(JSON.stringify(value, null, 2)); }
+function help() { console.log("Usage:\n  media-event list\n  media-event show --media-id <id>\n  media-event complete --media-id <id> --project <alias> --path <project-relative-path>\n  media-event validate"); }
+function loadDotEnv(file) {
+  if (!existsSync(file)) return;
+  for (const line of readFileSync(file, "utf8").split(/\r?\n/)) {
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (match && process.env[match[1]] === undefined) process.env[match[1]] = match[2].replace(/^["']|["']$/g, "");
+  }
+}
