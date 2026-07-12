@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/bot.js",
-    "check": "node --check src/bot.js && node --check src/media-index.js && node --check src/media-triggers.js && node --check src/schedule-store.js && node --check scripts/media-index && node --check scripts/media-event && node --check scripts/schedule-task && node --check scripts/project-manager && node test/media-triggers.test.js && node test/media-cache.test.js"
+    "check": "node --check src/bot.js && node --check src/bundled-skills.js && node --check src/media-index.js && node --check src/media-triggers.js && node --check src/schedule-store.js && node --check scripts/media-index && node --check scripts/media-event && node --check scripts/schedule-task && node --check scripts/project-manager && node test/bundled-skills.test.js && node test/media-triggers.test.js && node test/media-cache.test.js"
   },
   "engines": {
     "node": ">=22"

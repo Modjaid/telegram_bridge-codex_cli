@@ -9,6 +9,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 - `src/bot.js` - main process: config, Telegram/CollabMD routing, session state, Codex spawning, media download/STT.
 - `src/media-index.js` - locked, atomic shared media-cache index helpers.
 - `src/media-triggers.js` - discovers and runs project-skill media subscriptions.
+- `src/bundled-skills.js` and `bundled-skills/` - versioned skills installed into the service user's Codex home at Bridge startup.
 - `scripts/media-event` - CLI for inspecting events and registering persistent project artifacts.
 - `.env.example` - supported config knobs.
 - `systemd/*.service.example` - service templates.
@@ -26,6 +27,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 - Telegram session key is global (`telegram`), so project switches/reset affect the whole Telegram bridge session.
 - Telegram media is downloaded once into the shared seven-day XDG cache (`$XDG_CACHE_HOME/codex-telegram-bridge/telegram-media`, or `~/.cache/...`; override with `TELEGRAM_MEDIA_CACHE_ROOT`). Project-specific processing belongs in `.codex/skills/*/telegram-media-trigger.json` plus that skill's scripts; reply resolution must never rerun triggers or STT.
 - Register persistent project artifacts with `scripts/media-event complete`; do not hand-edit the shared `.media-index.json`.
+- Keep bundled skill `VERSION` files in sync with material skill changes; startup must preserve an installed version newer than the bundle.
 - Telegram voice prompts reuse the STT progress message as the Codex live progress log to avoid extra `Transcribed` chat messages.
 - If behavior, config, project handling, service setup, or media flow changes, update this file in the same change.
 

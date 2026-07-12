@@ -16,6 +16,7 @@ import {
   upsertMediaRecord,
 } from "./media-index.js";
 import { runMediaTriggers } from "./media-triggers.js";
+import { installBundledSkills } from "./bundled-skills.js";
 import {
   formatZonedDate,
   getScheduleTask,
@@ -37,6 +38,9 @@ const STATE_FILE = path.join(STATE_DIR, "state.json");
 const SCHEDULE_PROJECT = ROOT;
 
 loadDotEnv(path.join(ROOT, ".env"));
+for (const result of installBundledSkills(ROOT)) {
+  console.log(`Bundled skill ${result.name}: ${result.action}${result.version ? ` (${result.version})` : ""}`);
+}
 
 const config = {
   telegramEnabled: parseBool(process.env.TELEGRAM_ADAPTER_ENABLED || (process.env.BOT_TOKEN ? "true" : "false")),

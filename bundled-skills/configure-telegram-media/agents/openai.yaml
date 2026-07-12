@@ -1,0 +1,4 @@
+interface:
+  display_name: "Configure Telegram Media"
+  short_description: "Create project media trigger handlers"
+  default_prompt: "Use $configure-telegram-media to configure project-specific Telegram file handling."
