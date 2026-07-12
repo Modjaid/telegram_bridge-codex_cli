@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Telegram Projects"
+  short_description: "Create or connect Telegram Bridge projects"
+  default_prompt: "Use $manage-telegram-projects to create or connect a Telegram Bridge project."

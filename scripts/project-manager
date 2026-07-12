@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
@@ -55,6 +55,40 @@ function main() {
     return print({
       ok: true,
       action: "created",
+      alias,
+      project,
+      agentsPath,
+      createRoot,
+      projects,
+      projectCommands: Object.fromEntries(commands),
+    });
+  }
+
+  if (command === "add") {
+    const inputName = required(args, "name");
+    const alias = normalizeProjectName(inputName);
+    if (!alias) throw new Error("Project name must contain letters, numbers, underscore, or dash.");
+    if (commands.has(alias)) throw new Error(`Project command already exists: /${alias}`);
+
+    const project = path.resolve(required(args, "path"));
+    if (!existsSync(project) || !statSync(project).isDirectory()) {
+      throw new Error(`Existing project directory not found: ${project}`);
+    }
+    if (projects.some(item => path.resolve(item) === project)) {
+      throw new Error(`Project is already allowed: ${project}`);
+    }
+
+    const agentsPath = path.join(project, "AGENTS.md");
+    if (!existsSync(agentsPath)) {
+      writeFileSync(agentsPath, defaultAgentsMd(alias), { mode: 0o600 });
+    }
+
+    projects.push(project);
+    commands.set(alias, project);
+    writeProjectEnv(env, projects, commands, createRoot);
+    return print({
+      ok: true,
+      action: "added",
       alias,
       project,
       agentsPath,
@@ -168,7 +202,7 @@ function addProjectAlias(commands, alias, project) {
 }
 
 function normalizeProjectName(value) {
-  const normalized = String(value || "").trim().toLowerCase().replace(/-/g, "_");
+  const normalized = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
   return /^[a-z0-9_]+$/.test(normalized) ? normalized : "";
 }
 
@@ -226,5 +260,6 @@ function help() {
   console.log(`Usage:
   project-manager list
   project-manager create --name <projectName> [--root <parentPath>]
+  project-manager add --name <projectAlias> --path <existingFolder>
   project-manager delete --name <projectName> [--root <parentPath>]`);
 }

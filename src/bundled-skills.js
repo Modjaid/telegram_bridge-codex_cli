@@ -8,7 +8,7 @@ export function installBundledSkills(root, options = {}) {
   const codexHome = path.resolve(options.codexHome || process.env.CODEX_HOME || path.join(homedir(), ".codex"));
   const skillsRoot = path.join(codexHome, "skills");
   mkdirSync(skillsRoot, { recursive: true, mode: 0o700 });
-  const names = options.names || ["configure-telegram-media"];
+  const names = options.names || ["configure-telegram-media", "manage-telegram-projects"];
   return names.map(name => installOne(sourceRoot, skillsRoot, name));
 }
 
