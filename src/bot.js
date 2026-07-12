@@ -1619,13 +1619,9 @@ function projectCommandsText() {
 
 function projectCommandsKeyboard() {
   return {
-    inline_keyboard: [
-      ...config.projects.map((project, index) => ([{
-        text: `${index + 1}. ${projectAliasForPath(project)}`,
-        callback_data: `project:select:${index}`,
-      }])),
-      [{ text: "Create new project", callback_data: "project:create" }],
-    ],
+    inline_keyboard: [[
+      { text: "Create new project", callback_data: "project:create" },
+    ]],
   };
 }
 
