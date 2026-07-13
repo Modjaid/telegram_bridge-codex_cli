@@ -220,7 +220,7 @@ function runBridge() {
     child.once("exit", (code, signal) => signal ? reject(new Error(`Bridge stopped by ${signal}`)) : code === 0 ? resolve() : reject(new Error(`Bridge exited with status ${code}`)));
   });
 }
-function update(out) { out("Update the package with: npm update -g codex-telegram-bridge\nPersistent data will be preserved."); }
+function update(out) { out("Update the package with: npm install -g github:Modjaid/telegram_bridge-codex_cli\nPersistent data will be preserved."); }
 function assertEnvironment() {
   if (process.platform !== "linux") throw new Error("This installer currently supports Linux.");
   if (Number(process.versions.node.split(".")[0]) < 22) throw new Error("Node.js 22 or newer is required.");

@@ -23,6 +23,10 @@ try {
   assert.throws(() => validateSttLanguage("russian"), /Invalid STT language/);
 
   const output = [];
+  await main(["update"], { out: line => output.push(line), error: line => { throw new Error(line); } });
+  assert.match(output.at(-1), /npm install -g github:Modjaid\/telegram_bridge-codex_cli/);
+  assert.doesNotMatch(output.at(-1), /npm update -g codex-telegram-bridge/);
+
   await main(["configure"], { out: line => output.push(line), error: line => { throw new Error(line); } });
   assert.ok(existsSync(paths.configFile));
   assert.equal(statSync(paths.configFile).mode & 0o777, 0o600);

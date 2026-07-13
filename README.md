@@ -68,6 +68,18 @@ On first configuration, the Bridge creates a default project named after the Lin
 
 Useful lifecycle commands are `start`, `stop`, `restart`, `status`, `doctor`, `login`, `add-user`, `update`, and `uninstall`. Ordinary uninstall disables the user service but preserves data. `uninstall --purge --yes` also removes `~/.codex-telegram-bridge`, but never Codex or Google credentials.
 
+To update an existing installation from the GitHub release source:
+
+```bash
+npm install -g github:Modjaid/telegram_bridge-codex_cli
+codex-telegram-bridge restart
+codex-telegram-bridge doctor
+```
+
+The unscoped `codex-telegram-bridge` name on the public npm registry belongs to a
+different project, so do not use `npm update -g codex-telegram-bridge` for this
+Bridge.
+
 To migrate an existing checkout without deleting it:
 
 ```bash
