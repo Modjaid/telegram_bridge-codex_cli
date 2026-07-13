@@ -34,6 +34,11 @@ The default project is a regular directory rather than a Git repository, so fres
 configurations also enable `CODEX_SKIP_GIT_REPO_CHECK=true`. Users can disable it
 after initializing the project as a trusted Git repository.
 
+Fresh configurations use `CODEX_SANDBOX=danger-full-access` so Bridge-driven Codex
+commands work on hosts without Bubblewrap and can use skills outside the project
+directory. Codex then has the same filesystem access as the Linux user running the
+Bridge. Set it to `workspace-write` when host sandboxing is installed and preferred.
+
 For automation, keep the bot token in a mode-0600 file rather than a command-line argument:
 
 ```bash

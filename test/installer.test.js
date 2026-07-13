@@ -31,6 +31,7 @@ try {
   const codexBin = resolveCommand("codex");
   assert.ok(path.isAbsolute(codexBin), "test requires Codex CLI on PATH");
   assert.match(first, new RegExp(`CODEX_BIN=${codexBin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(first, /^CODEX_SANDBOX=danger-full-access$/m);
   assert.match(first, /^CODEX_SKIP_GIT_REPO_CHECK=true$/m);
   assert.match(first, new RegExp(`PROJECT_CREATE_ROOT=${paths.projectsRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   assert.match(first, new RegExp(`PROJECT_ALLOWLIST=${defaultProject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
