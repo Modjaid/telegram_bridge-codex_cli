@@ -47,8 +47,7 @@ async function configure(args, io) {
   const paths = ensureLayout();
   const existing = existsSync(paths.configFile) ? readFileSync(paths.configFile, "utf8") : "";
   const env = parseEnv(existing);
-  env.PROJECT_CREATE_ROOT ||= paths.projectsRoot;
-  if (!env.PROJECT_ALLOWLIST) env.PROJECT_ALLOWLIST = paths.projectsRoot;
+  ensureDefaultProject(env, paths);
   if (args["token-file"]) {
     const token = readFileSync(path.resolve(args["token-file"]), "utf8").trim();
     await validateTelegramToken(token);
@@ -66,6 +65,31 @@ async function configure(args, io) {
   }
   safeWriteConfig(paths.configFile, serializeEnv(env));
   io.out(`Configuration ready: ${paths.configFile}`);
+}
+
+function ensureDefaultProject(env, paths) {
+  const projectName = path.basename(paths.home).trim().toLowerCase().replace(/[^a-z0-9_]+/g, "_") || "home";
+  env.PROJECT_CREATE_ROOT ||= paths.home;
+  env.PROJECT_ALLOWLIST ||= paths.home;
+  env.PROJECT_COMMANDS ||= `${projectName}=${paths.home}`;
+  const agentsPath = path.join(paths.home, "AGENTS.md");
+  if (!existsSync(agentsPath)) {
+    writeFileSync(agentsPath, defaultProjectAgentsMd(projectName), { mode: 0o600 });
+  }
+}
+
+function defaultProjectAgentsMd(projectName) {
+  return [
+    `# AGENTS.md instructions for /${projectName}`,
+    "",
+    "This project was created by the Codex Telegram Bridge.",
+    "",
+    "## Notes",
+    "",
+    "- Keep project-specific instructions here.",
+    "- Update this file when project behavior or conventions change.",
+    "",
+  ].join("\n");
 }
 
 async function addUser(args, io) {

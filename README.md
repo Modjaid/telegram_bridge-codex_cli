@@ -33,6 +33,8 @@ codex-telegram-bridge setup --token-file /secure/path/bot-token --user-id 123456
 
 Installed code is managed by npm. Configuration, projects, state, logs, and temporary Bridge data are kept under `~/.codex-telegram-bridge/`; Codex credentials in `~/.codex/` and Google Workspace MCP credentials are independent and are never copied or removed by Bridge.
 
+On first configuration, the Bridge registers the Linux user's home directory as the default project, creates a matching slash command (for example `/ksu` for `/home/ksu`), and creates `~/AGENTS.md` when it does not already exist. Existing project settings and existing instructions are preserved.
+
 Useful lifecycle commands are `start`, `stop`, `restart`, `status`, `doctor`, `login`, `add-user`, `update`, and `uninstall`. Ordinary uninstall disables the user service but preserves data. `uninstall --purge --yes` also removes `~/.codex-telegram-bridge`, but never Codex or Google credentials.
 
 To migrate an existing checkout without deleting it:
