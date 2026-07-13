@@ -23,13 +23,14 @@ try {
   await main(["configure"], { out: line => output.push(line), error: line => { throw new Error(line); } });
   assert.ok(existsSync(paths.configFile));
   assert.equal(statSync(paths.configFile).mode & 0o777, 0o600);
-  assert.ok(existsSync(path.join(home, "AGENTS.md")));
-  assert.equal(statSync(path.join(home, "AGENTS.md")).mode & 0o777, 0o600);
-  const first = readFileSync(paths.configFile, "utf8");
-  assert.match(first, new RegExp(`PROJECT_CREATE_ROOT=${home.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
-  assert.match(first, new RegExp(`PROJECT_ALLOWLIST=${home.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   const projectName = path.basename(home).toLowerCase().replace(/[^a-z0-9_]+/g, "_");
-  assert.match(first, new RegExp(`PROJECT_COMMANDS=${projectName}=${home.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  const defaultProject = path.join(paths.projectsRoot, projectName);
+  assert.ok(existsSync(path.join(defaultProject, "AGENTS.md")));
+  assert.equal(statSync(path.join(defaultProject, "AGENTS.md")).mode & 0o777, 0o600);
+  const first = readFileSync(paths.configFile, "utf8");
+  assert.match(first, new RegExp(`PROJECT_CREATE_ROOT=${paths.projectsRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(first, new RegExp(`PROJECT_ALLOWLIST=${defaultProject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match(first, new RegExp(`PROJECT_COMMANDS=${projectName}=${defaultProject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 
   await main(["configure"], { out: line => output.push(line), error: line => { throw new Error(line); } });
   assert.equal(readFileSync(paths.configFile, "utf8"), first);

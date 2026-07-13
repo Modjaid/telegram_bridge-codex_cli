@@ -69,10 +69,12 @@ async function configure(args, io) {
 
 function ensureDefaultProject(env, paths) {
   const projectName = path.basename(paths.home).trim().toLowerCase().replace(/[^a-z0-9_]+/g, "_") || "home";
-  env.PROJECT_CREATE_ROOT ||= paths.home;
-  env.PROJECT_ALLOWLIST ||= paths.home;
-  env.PROJECT_COMMANDS ||= `${projectName}=${paths.home}`;
-  const agentsPath = path.join(paths.home, "AGENTS.md");
+  const defaultProject = path.join(paths.projectsRoot, projectName);
+  env.PROJECT_CREATE_ROOT ||= paths.projectsRoot;
+  env.PROJECT_ALLOWLIST ||= defaultProject;
+  env.PROJECT_COMMANDS ||= `${projectName}=${defaultProject}`;
+  mkdirSync(defaultProject, { recursive: true, mode: 0o700 });
+  const agentsPath = path.join(defaultProject, "AGENTS.md");
   if (!existsSync(agentsPath)) {
     writeFileSync(agentsPath, defaultProjectAgentsMd(projectName), { mode: 0o600 });
   }

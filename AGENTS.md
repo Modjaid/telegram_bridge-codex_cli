@@ -24,7 +24,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 
 - Use existing no-dependency Node style; package requires Node `>=22`.
 - Installed deployments use `~/.codex-telegram-bridge/config.env`; projects, state and logs live under that persistent data root and never under the npm package. `PROJECT_ALLOWLIST` is the comma-separated list of allowed absolute paths, and `PROJECT_COMMANDS` maps slash aliases to paths from that allowlist.
-- First-time configuration registers the Linux user's home directory as the default project, maps the username slash alias to it, and creates `~/AGENTS.md` without replacing existing instructions.
+- First-time configuration creates a username-named default project under `~/.codex-telegram-bridge/projects`, maps the username slash alias to it, and creates its `AGENTS.md` without replacing existing instructions.
 - Telegram project create/attach/delete must go through `scripts/project-manager`; do not hand-edit `.env` for that flow. Created or attached projects must include an `AGENTS.md` file. Deleting a project recursively removes its folder and is restricted to paths inside `PROJECT_CREATE_ROOT`.
 - Telegram session key is global (`telegram`), so project switches/reset affect the whole Telegram bridge session.
 - Project-switch confirmations list global and project-local skills without duplicates, followed by a non-recursive first-level directory listing capped to fit a Telegram message.
