@@ -15,7 +15,9 @@ For CollabMD-only mode, set `TELEGRAM_ADAPTER_ENABLED=false` and `COLLABMD_ADAPT
 
 ## Install and setup
 
-Requirements: Linux, Node.js 22+, npm, and Codex CLI.
+Requirements: Linux, Node.js 22+, and npm. Local STT additionally requires Python 3
+with venv support and ffmpeg. Codex CLI and the Python `faster-whisper` package are
+detected and installed by `setup` when missing.
 
 Install directly from GitHub, then run the interactive setup:
 
@@ -29,6 +31,14 @@ During setup, the installer resolves Codex CLI to an absolute path and stores it
 `CODEX_BIN`. This keeps the service working under systemd even when Codex was
 installed in a user-local directory that is not part of the systemd user manager's
 default `PATH`.
+
+`setup` is dependency-aware: it reuses an existing Codex CLI or installs
+`@openai/codex` with npm when missing. It also creates
+`~/.codex-telegram-bridge/.venv`, installs `faster-whisper`, downloads
+`Systran/faster-whisper-small`, and configures Russian CPU transcription with
+`int8`, VAD, beam size 3, and audio normalization. Python 3 with venv support and
+ffmpeg are system prerequisites; setup reports the exact missing prerequisite.
+Use `setup --skip-local-stt` to opt out of local transcription installation.
 
 The default project is a regular directory rather than a Git repository, so fresh
 configurations also enable `CODEX_SKIP_GIT_REPO_CHECK=true`. Users can disable it

@@ -33,8 +33,11 @@ export async function main(argv, io = {}) {
 async function setup(args, io) {
   assertEnvironment();
   const paths = ensureLayout();
+  ensureCodexCli(io);
+  if (!args["skip-local-stt"]) ensureLocalWhisper(paths, io);
   if (args["migrate-from"]) migrate({ from: args["migrate-from"] }, io.out);
   await configure(args, io);
+  if (!args["skip-local-stt"]) configureLocalWhisper(paths);
   installUnit(paths);
   if (!args["no-start"] && commandExists("systemctl")) {
     run("systemctl", ["--user", "daemon-reload"]);
@@ -127,6 +130,11 @@ async function doctor(io) {
   checks.push(check("Codex CLI", codexInstalled, codexInstalled ? codexBin : `not found: ${codexBin}`));
   const codexAuth = codexInstalled && spawnSync(codexBin, ["login", "status"], { encoding: "utf8" }).status === 0;
   checks.push(check("Codex authentication", codexAuth, codexAuth ? "ready" : "login required"));
+  const whisperPython = path.join(paths.dataRoot, ".venv", "bin", "python");
+  const whisperInstalled = existsSync(whisperPython) && spawnSync(whisperPython, ["-c", "import faster_whisper"], { stdio: "ignore" }).status === 0;
+  const sttConfigured = Boolean(env.STT_COMMAND);
+  checks.push(check("Local faster-whisper", whisperInstalled, whisperInstalled ? whisperPython : sttConfigured ? "not installed; rerun setup" : "not configured (optional)", !sttConfigured));
+  checks.push(check("ffmpeg", commandExists("ffmpeg"), commandExists("ffmpeg") ? resolveCommand("ffmpeg") : sttConfigured ? "not found" : "not required (optional)", !sttConfigured));
   checks.push(check("Bridge config", existsSync(paths.configFile), existsSync(paths.configFile) ? "found" : "not found"));
   const configMode = existsSync(paths.configFile) ? statSync(paths.configFile).mode & 0o777 : 0;
   checks.push(check("Bridge config permissions", configMode === 0o600, configMode ? configMode.toString(8) : "n/a"));
@@ -207,13 +215,56 @@ function update(out) { out("Update the package with: npm update -g codex-telegra
 function assertEnvironment() {
   if (process.platform !== "linux") throw new Error("This installer currently supports Linux.");
   if (Number(process.versions.node.split(".")[0]) < 22) throw new Error("Node.js 22 or newer is required.");
-  if (!resolveCommand("codex")) throw new Error("Codex CLI is required. Install it with npm install -g @openai/codex.");
+}
+function ensureCodexCli(io) {
+  const existing = resolveCommand("codex");
+  if (existing) return io.out(`Codex CLI found: ${existing}`);
+  const npm = resolveCommand("npm");
+  if (!npm) throw new Error("Codex CLI is missing and npm was not found. Install Node.js 22 with npm, then rerun setup.");
+  io.out("Codex CLI not found. Installing @openai/codex...");
+  run(npm, ["install", "-g", "@openai/codex"]);
+  const installed = resolveCommand("codex");
+  if (!installed) throw new Error("Codex CLI was installed but is not on PATH. Add the npm global bin directory to PATH and rerun setup.");
+  io.out(`Codex CLI installed: ${installed}`);
+}
+function ensureLocalWhisper(paths, io) {
+  const python3 = resolveCommand("python3");
+  if (!python3) throw new Error("Local STT requires Python 3. Install python3 and python3-venv, then rerun setup.");
+  if (!resolveCommand("ffmpeg")) throw new Error("Local STT requires ffmpeg. Install ffmpeg with your system package manager, then rerun setup.");
+  const venv = path.join(paths.dataRoot, ".venv");
+  const python = path.join(venv, "bin", "python");
+  if (!existsSync(python)) {
+    io.out(`Creating local STT environment: ${venv}`);
+    run(python3, ["-m", "venv", venv]);
+  }
+  if (spawnSync(python, ["-c", "import faster_whisper"], { stdio: "ignore" }).status !== 0) {
+    io.out("Installing faster-whisper...");
+    run(python, ["-m", "pip", "install", "--upgrade", "pip"]);
+    run(python, ["-m", "pip", "install", "faster-whisper"]);
+  } else io.out("faster-whisper found in the Bridge environment.");
+  io.out("Preparing Systran/faster-whisper-small (CPU int8)...");
+  run(python, ["-c", 'from faster_whisper import WhisperModel; WhisperModel("Systran/faster-whisper-small", device="cpu", compute_type="int8"); print("Local Whisper model ready")']);
+}
+export function configureLocalWhisper(paths) {
+  const env = parseEnv(readRequired(paths.configFile));
+  const python = path.join(paths.dataRoot, ".venv", "bin", "python");
+  env.STT_COMMAND ||= `${python} ${path.join(PACKAGE_ROOT, "scripts", "transcribe-faster-whisper.py")}`;
+  env.STT_NORMALIZE_AUDIO ||= "true";
+  env.LOCAL_WHISPER_MODEL ||= "Systran/faster-whisper-small";
+  env.LOCAL_WHISPER_DEVICE ||= "cpu";
+  env.LOCAL_WHISPER_COMPUTE_TYPE ||= "int8";
+  env.LOCAL_WHISPER_CPU_THREADS ||= "4";
+  env.LOCAL_WHISPER_LANGUAGE ||= "ru";
+  env.LOCAL_WHISPER_LOCAL_FILES_ONLY ||= "true";
+  env.LOCAL_WHISPER_VAD ||= "true";
+  env.LOCAL_WHISPER_BEAM_SIZE ||= "3";
+  safeWriteConfig(paths.configFile, serializeEnv(env));
 }
 function ensureLayout() { const p = resolveBridgePaths(); for (const dir of [p.dataRoot,p.projectsRoot,p.stateRoot,p.logsRoot,p.cacheRoot]) mkdirSync(dir,{recursive:true,mode:0o700}); return p; }
 function safeWriteConfig(file, data) { mkdirSync(path.dirname(file),{recursive:true,mode:0o700}); if(existsSync(file)){const backup=`${file}.bak`; copyFileSync(file,backup); chmodSync(backup,0o600);} const temp=`${file}.${process.pid}.tmp`; writeFileSync(temp,data,{mode:0o600}); renameSync(temp,file); chmodSync(file,0o600); }
 function parseEnv(text) { const result={}; for(const line of text.split(/\r?\n/)){const m=line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/); if(m) result[m[1]]=m[2].replace(/^["']|["']$/g,"");} return result; }
 function serializeEnv(env) { return `${Object.entries(env).map(([k,v])=>`${k}=${String(v).replace(/[\r\n]/g,"")}`).join("\n")}\n`; }
-function parseArgs(tokens) { const r={}; for(let i=0;i<tokens.length;i++){const t=tokens[i]; if(!t.startsWith("--")) throw new Error(`Unexpected argument: ${t}`); const k=t.slice(2); if(["yes","no-start","purge"].includes(k)) r[k]=true; else {if(tokens[i+1]===undefined) throw new Error(`Missing value for --${k}`); r[k]=tokens[++i];}} return r; }
+function parseArgs(tokens) { const r={}; for(let i=0;i<tokens.length;i++){const t=tokens[i]; if(!t.startsWith("--")) throw new Error(`Unexpected argument: ${t}`); const k=t.slice(2); if(["yes","no-start","purge","skip-local-stt"].includes(k)) r[k]=true; else {if(tokens[i+1]===undefined) throw new Error(`Missing value for --${k}`); r[k]=tokens[++i];}} return r; }
 function run(bin,args){const r=spawnSync(bin,args,{stdio:"inherit"}); if(r.error) throw r.error; if(r.status!==0) throw new Error(`${bin} exited with status ${r.status}`);}
 function commandExists(bin){return spawnSync("sh",["-c",`command -v "$1" >/dev/null 2>&1`,"sh",bin]).status===0;}
 export function resolveCommand(bin){const r=spawnSync("sh",["-c",`command -v "$1"`,"sh",bin],{encoding:"utf8"}); if(r.status!==0) return ""; const found=r.stdout.trim(); return path.isAbsolute(found)?found:"";}
@@ -230,6 +281,6 @@ function safeUser(user){return [user.first_name,user.last_name,user.username?`@$
 function systemdQuote(value){return `"${String(value).replace(/([\\"])/g,"\\$1")}"`;}
 function systemdPath(value){if(/[\r\n]/.test(value)) throw new Error("Invalid newline in systemd path."); return String(value).replace(/ /g,"\\x20");}
 function redact(value){return String(value).replace(/\b\d{6,}:[A-Za-z0-9_-]+\b/g,"[REDACTED]");}
-function help(){return `Usage: codex-telegram-bridge <command> [options]\n\nCommands: setup, configure, start, stop, restart, status, doctor, login, add-user, update, uninstall\n\nNon-interactive setup: --token-file <0600-file> --user-id <id> --yes\nUninstall data too: uninstall --purge --yes`;}
+function help(){return `Usage: codex-telegram-bridge <command> [options]\n\nCommands: setup, configure, start, stop, restart, status, doctor, login, add-user, update, uninstall\n\nNon-interactive setup: --token-file <0600-file> --user-id <id> --yes\nSkip automatic local speech-to-text: setup --skip-local-stt\nUninstall data too: uninstall --purge --yes`;}
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) await main(process.argv.slice(2));
