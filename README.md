@@ -40,6 +40,13 @@ default `PATH`.
 ffmpeg are system prerequisites; setup reports the exact missing prerequisite.
 Use `setup --skip-local-stt` to opt out of local transcription installation.
 
+Interactive setup asks before installing a missing Codex CLI or local Whisper. It
+checks `codex login status` and launches the normal Codex login flow when required.
+The Whisper model is multilingual; the language menu selects a recognition hint
+(Russian, English, automatic detection, German, Spanish, French, Italian,
+Ukrainian, Polish, or Turkish), not a separate language download. Automation can
+use `--yes --stt-language ru` (or another ISO code, or `auto`).
+
 The default project is a regular directory rather than a Git repository, so fresh
 configurations also enable `CODEX_SKIP_GIT_REPO_CHECK=true`. Users can disable it
 after initializing the project as a trusted Git repository.

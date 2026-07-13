@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { createInterface } from "node:readline/promises";
 import { PACKAGE_ROOT, resolveBridgePaths } from "./paths.js";
 
 const SERVICE = "codex-telegram-bridge.service";
@@ -33,11 +34,19 @@ export async function main(argv, io = {}) {
 async function setup(args, io) {
   assertEnvironment();
   const paths = ensureLayout();
-  ensureCodexCli(io);
-  if (!args["skip-local-stt"]) ensureLocalWhisper(paths, io);
+  const codexBin = await ensureCodexCli(args, io);
+  await ensureCodexAuthentication(codexBin, args, io);
+  let sttLanguage = "ru";
+  if (!args["skip-local-stt"]) {
+    const installStt = localWhisperInstalled(paths) || await confirm(args, io, "Install local faster-whisper speech recognition?", true);
+    if (installStt) {
+      sttLanguage = await chooseSttLanguage(paths, args, io);
+      ensureLocalWhisper(paths, io);
+    } else args["skip-local-stt"] = true;
+  }
   if (args["migrate-from"]) migrate({ from: args["migrate-from"] }, io.out);
   await configure(args, io);
-  if (!args["skip-local-stt"]) configureLocalWhisper(paths);
+  if (!args["skip-local-stt"]) configureLocalWhisper(paths, sttLanguage);
   installUnit(paths);
   if (!args["no-start"] && commandExists("systemctl")) {
     run("systemctl", ["--user", "daemon-reload"]);
@@ -216,17 +225,28 @@ function assertEnvironment() {
   if (process.platform !== "linux") throw new Error("This installer currently supports Linux.");
   if (Number(process.versions.node.split(".")[0]) < 22) throw new Error("Node.js 22 or newer is required.");
 }
-function ensureCodexCli(io) {
+async function ensureCodexCli(args, io) {
   const existing = resolveCommand("codex");
-  if (existing) return io.out(`Codex CLI found: ${existing}`);
+  if (existing) { io.out(`Codex CLI found: ${existing}`); return existing; }
   const npm = resolveCommand("npm");
   if (!npm) throw new Error("Codex CLI is missing and npm was not found. Install Node.js 22 with npm, then rerun setup.");
+  if (!await confirm(args, io, "Codex CLI was not found. Install @openai/codex now?", true)) throw new Error("Codex CLI is required. Installation was declined.");
   io.out("Codex CLI not found. Installing @openai/codex...");
   run(npm, ["install", "-g", "@openai/codex"]);
   const installed = resolveCommand("codex");
   if (!installed) throw new Error("Codex CLI was installed but is not on PATH. Add the npm global bin directory to PATH and rerun setup.");
   io.out(`Codex CLI installed: ${installed}`);
+  return installed;
 }
+async function ensureCodexAuthentication(codexBin, args, io) {
+  if (spawnSync(codexBin, ["login", "status"], { stdio: "ignore" }).status === 0) return io.out("Codex authentication: ready");
+  if (!await confirm(args, io, "Codex is not authenticated. Start Codex login now?", true)) throw new Error("Codex login is required. Run codex-telegram-bridge login, then rerun setup.");
+  if (!process.stdin.isTTY && !io.ask) throw new Error("Codex login requires an interactive terminal. Run codex-telegram-bridge login, then rerun setup.");
+  run(codexBin, ["login"]);
+  if (spawnSync(codexBin, ["login", "status"], { stdio: "ignore" }).status !== 0) throw new Error("Codex authentication did not complete. Run codex-telegram-bridge login, then rerun setup.");
+  io.out("Codex authentication: ready");
+}
+function localWhisperInstalled(paths) { const python=path.join(paths.dataRoot,".venv","bin","python"); return existsSync(python)&&spawnSync(python,["-c","import faster_whisper"],{stdio:"ignore"}).status===0; }
 function ensureLocalWhisper(paths, io) {
   const python3 = resolveCommand("python3");
   if (!python3) throw new Error("Local STT requires Python 3. Install python3 and python3-venv, then rerun setup.");
@@ -245,7 +265,7 @@ function ensureLocalWhisper(paths, io) {
   io.out("Preparing Systran/faster-whisper-small (CPU int8)...");
   run(python, ["-c", 'from faster_whisper import WhisperModel; WhisperModel("Systran/faster-whisper-small", device="cpu", compute_type="int8"); print("Local Whisper model ready")']);
 }
-export function configureLocalWhisper(paths) {
+export function configureLocalWhisper(paths, language = "ru") {
   const env = parseEnv(readRequired(paths.configFile));
   const python = path.join(paths.dataRoot, ".venv", "bin", "python");
   env.STT_COMMAND ||= `${python} ${path.join(PACKAGE_ROOT, "scripts", "transcribe-faster-whisper.py")}`;
@@ -254,11 +274,34 @@ export function configureLocalWhisper(paths) {
   env.LOCAL_WHISPER_DEVICE ||= "cpu";
   env.LOCAL_WHISPER_COMPUTE_TYPE ||= "int8";
   env.LOCAL_WHISPER_CPU_THREADS ||= "4";
-  env.LOCAL_WHISPER_LANGUAGE ||= "ru";
+  env.LOCAL_WHISPER_LANGUAGE ||= language === "auto" ? "" : language;
   env.LOCAL_WHISPER_LOCAL_FILES_ONLY ||= "true";
   env.LOCAL_WHISPER_VAD ||= "true";
   env.LOCAL_WHISPER_BEAM_SIZE ||= "3";
   safeWriteConfig(paths.configFile, serializeEnv(env));
+}
+async function chooseSttLanguage(paths, args, io) {
+  if (args["stt-language"]) return validateSttLanguage(args["stt-language"]);
+  if (existsSync(paths.configFile)) { const current=parseEnv(readFileSync(paths.configFile,"utf8")).LOCAL_WHISPER_LANGUAGE; if(current!==undefined) return current||"auto"; }
+  if (args.yes) return "ru";
+  const choices = ["ru","en","auto","de","es","fr","it","uk","pl","tr"];
+  const answer = (await ask(io, "Speech language [1=Russian, 2=English, 3=Auto, 4=German, 5=Spanish, 6=French, 7=Italian, 8=Ukrainian, 9=Polish, 10=Turkish] (default 1): ")).trim();
+  if (!answer) return "ru";
+  const index = Number(answer);
+  return validateSttLanguage(Number.isInteger(index)&&index>=1&&index<=choices.length?choices[index-1]:answer);
+}
+export function validateSttLanguage(value) { const language=String(value).trim().toLowerCase(); if(language==="auto"||/^[a-z]{2,3}$/.test(language)) return language; throw new Error(`Invalid STT language: ${value}. Use a language code such as ru, en, de, or auto.`); }
+async function confirm(args, io, prompt, defaultYes) {
+  if (args.yes) return true;
+  const answer=(await ask(io, `${prompt} ${defaultYes?"[Y/n]":"[y/N]"} `)).trim().toLowerCase();
+  if (!answer) return defaultYes;
+  return ["y","yes"].includes(answer);
+}
+async function ask(io, prompt) {
+  if (io.ask) return String(await io.ask(prompt));
+  if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error(`Interactive input is required: ${prompt.trim()} Rerun with --yes or provide explicit options.`);
+  const rl=createInterface({input:process.stdin,output:process.stdout});
+  try{return await rl.question(prompt);}finally{rl.close();}
 }
 function ensureLayout() { const p = resolveBridgePaths(); for (const dir of [p.dataRoot,p.projectsRoot,p.stateRoot,p.logsRoot,p.cacheRoot]) mkdirSync(dir,{recursive:true,mode:0o700}); return p; }
 function safeWriteConfig(file, data) { mkdirSync(path.dirname(file),{recursive:true,mode:0o700}); if(existsSync(file)){const backup=`${file}.bak`; copyFileSync(file,backup); chmodSync(backup,0o600);} const temp=`${file}.${process.pid}.tmp`; writeFileSync(temp,data,{mode:0o600}); renameSync(temp,file); chmodSync(file,0o600); }
@@ -281,6 +324,6 @@ function safeUser(user){return [user.first_name,user.last_name,user.username?`@$
 function systemdQuote(value){return `"${String(value).replace(/([\\"])/g,"\\$1")}"`;}
 function systemdPath(value){if(/[\r\n]/.test(value)) throw new Error("Invalid newline in systemd path."); return String(value).replace(/ /g,"\\x20");}
 function redact(value){return String(value).replace(/\b\d{6,}:[A-Za-z0-9_-]+\b/g,"[REDACTED]");}
-function help(){return `Usage: codex-telegram-bridge <command> [options]\n\nCommands: setup, configure, start, stop, restart, status, doctor, login, add-user, update, uninstall\n\nNon-interactive setup: --token-file <0600-file> --user-id <id> --yes\nSkip automatic local speech-to-text: setup --skip-local-stt\nUninstall data too: uninstall --purge --yes`;}
+function help(){return `Usage: codex-telegram-bridge <command> [options]\n\nCommands: setup, configure, start, stop, restart, status, doctor, login, add-user, update, uninstall\n\nNon-interactive setup: --token-file <0600-file> --user-id <id> --stt-language <code|auto> --yes\nSkip automatic local speech-to-text: setup --skip-local-stt\nUninstall data too: uninstall --purge --yes`;}
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname)) await main(process.argv.slice(2));

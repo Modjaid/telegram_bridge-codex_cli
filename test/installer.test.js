@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { configureLocalWhisper, main, renderSystemdUnit, resolveCommand } from "../src/cli.js";
+import { configureLocalWhisper, main, renderSystemdUnit, resolveCommand, validateSttLanguage } from "../src/cli.js";
 import { resolveBridgePaths } from "../src/paths.js";
 
 const originalHome = process.env.HOME;
@@ -18,6 +18,9 @@ try {
   const unit = renderSystemdUnit(paths, "/opt/node/bin/node", "/opt/npm/bin/codex-telegram-bridge");
   assert.doesNotMatch(unit, /\/home\/agent\/codex-telegram-bridge/);
   assert.match(unit, /codex-telegram-bridge" run/);
+  assert.equal(validateSttLanguage("RU"), "ru");
+  assert.equal(validateSttLanguage("auto"), "auto");
+  assert.throws(() => validateSttLanguage("russian"), /Invalid STT language/);
 
   const output = [];
   await main(["configure"], { out: line => output.push(line), error: line => { throw new Error(line); } });
