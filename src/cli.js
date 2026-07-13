@@ -49,6 +49,7 @@ async function configure(args, io) {
   const env = parseEnv(existing);
   ensureDefaultProject(env, paths);
   env.CODEX_BIN ||= resolveCommand("codex") || "codex";
+  env.CODEX_SKIP_GIT_REPO_CHECK ||= "true";
   if (args["token-file"]) {
     const token = readFileSync(path.resolve(args["token-file"]), "utf8").trim();
     await validateTelegramToken(token);

@@ -30,6 +30,10 @@ During setup, the installer resolves Codex CLI to an absolute path and stores it
 installed in a user-local directory that is not part of the systemd user manager's
 default `PATH`.
 
+The default project is a regular directory rather than a Git repository, so fresh
+configurations also enable `CODEX_SKIP_GIT_REPO_CHECK=true`. Users can disable it
+after initializing the project as a trusted Git repository.
+
 For automation, keep the bot token in a mode-0600 file rather than a command-line argument:
 
 ```bash
