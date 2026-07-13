@@ -48,6 +48,7 @@ async function configure(args, io) {
   const existing = existsSync(paths.configFile) ? readFileSync(paths.configFile, "utf8") : "";
   const env = parseEnv(existing);
   ensureDefaultProject(env, paths);
+  env.CODEX_BIN ||= resolveCommand("codex") || "codex";
   if (args["token-file"]) {
     const token = readFileSync(path.resolve(args["token-file"]), "utf8").trim();
     await validateTelegramToken(token);
@@ -119,8 +120,10 @@ async function doctor(io) {
   const env = existsSync(paths.configFile) ? parseEnv(readFileSync(paths.configFile, "utf8")) : {};
   const checks = [];
   checks.push(check("Node.js", Number(process.versions.node.split(".")[0]) >= 22, process.version));
-  checks.push(check("Codex CLI", commandExists("codex"), commandExists("codex") ? "installed" : "not found"));
-  const codexAuth = commandExists("codex") && spawnSync("codex", ["login", "status"], { encoding: "utf8" }).status === 0;
+  const codexBin = env.CODEX_BIN || resolveCommand("codex") || "codex";
+  const codexInstalled = commandExists(codexBin);
+  checks.push(check("Codex CLI", codexInstalled, codexInstalled ? codexBin : `not found: ${codexBin}`));
+  const codexAuth = codexInstalled && spawnSync(codexBin, ["login", "status"], { encoding: "utf8" }).status === 0;
   checks.push(check("Codex authentication", codexAuth, codexAuth ? "ready" : "login required"));
   checks.push(check("Bridge config", existsSync(paths.configFile), existsSync(paths.configFile) ? "found" : "not found"));
   const configMode = existsSync(paths.configFile) ? statSync(paths.configFile).mode & 0o777 : 0;
@@ -185,7 +188,12 @@ function serviceCommand(command, out) {
   out(`${SERVICE}: ${command} requested`);
 }
 
-function login(out) { run("codex", ["login"]); out("Codex login command completed."); }
+function login(out) {
+  const paths = resolveBridgePaths();
+  const env = existsSync(paths.configFile) ? parseEnv(readFileSync(paths.configFile, "utf8")) : {};
+  run(env.CODEX_BIN || resolveCommand("codex") || "codex", ["login"]);
+  out("Codex login command completed.");
+}
 function runBridge() {
   const child = spawn(process.execPath, [path.join(PACKAGE_ROOT, "src", "bot.js")], { stdio: "inherit", env: process.env });
   return new Promise((resolve, reject) => {
@@ -197,7 +205,7 @@ function update(out) { out("Update the package with: npm update -g codex-telegra
 function assertEnvironment() {
   if (process.platform !== "linux") throw new Error("This installer currently supports Linux.");
   if (Number(process.versions.node.split(".")[0]) < 22) throw new Error("Node.js 22 or newer is required.");
-  if (!commandExists("codex")) throw new Error("Codex CLI is required. Install it with npm install -g @openai/codex.");
+  if (!resolveCommand("codex")) throw new Error("Codex CLI is required. Install it with npm install -g @openai/codex.");
 }
 function ensureLayout() { const p = resolveBridgePaths(); for (const dir of [p.dataRoot,p.projectsRoot,p.stateRoot,p.logsRoot,p.cacheRoot]) mkdirSync(dir,{recursive:true,mode:0o700}); return p; }
 function safeWriteConfig(file, data) { mkdirSync(path.dirname(file),{recursive:true,mode:0o700}); if(existsSync(file)){const backup=`${file}.bak`; copyFileSync(file,backup); chmodSync(backup,0o600);} const temp=`${file}.${process.pid}.tmp`; writeFileSync(temp,data,{mode:0o600}); renameSync(temp,file); chmodSync(file,0o600); }
@@ -206,6 +214,7 @@ function serializeEnv(env) { return `${Object.entries(env).map(([k,v])=>`${k}=${
 function parseArgs(tokens) { const r={}; for(let i=0;i<tokens.length;i++){const t=tokens[i]; if(!t.startsWith("--")) throw new Error(`Unexpected argument: ${t}`); const k=t.slice(2); if(["yes","no-start","purge"].includes(k)) r[k]=true; else {if(tokens[i+1]===undefined) throw new Error(`Missing value for --${k}`); r[k]=tokens[++i];}} return r; }
 function run(bin,args){const r=spawnSync(bin,args,{stdio:"inherit"}); if(r.error) throw r.error; if(r.status!==0) throw new Error(`${bin} exited with status ${r.status}`);}
 function commandExists(bin){return spawnSync("sh",["-c",`command -v "$1" >/dev/null 2>&1`,"sh",bin]).status===0;}
+export function resolveCommand(bin){const r=spawnSync("sh",["-c",`command -v "$1"`,"sh",bin],{encoding:"utf8"}); if(r.status!==0) return ""; const found=r.stdout.trim(); return path.isAbsolute(found)?found:"";}
 async function validateTelegramToken(token){if(!/^\d+:[A-Za-z0-9_-]+$/.test(token)) throw new Error("Telegram token has an invalid format."); const me=await telegram(token,"getMe",{}); return me;}
 async function telegram(token,method,body){const response=await fetch(`https://api.telegram.org/bot${token}/${method}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)}); const data=await response.json(); if(!data.ok) throw new Error(`Telegram API error: ${data.description || response.status}`); return data.result;}
 function addCsv(value,item){return [...new Set(String(value||"").split(",").filter(Boolean).concat(String(item)))].join(",");}

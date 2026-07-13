@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { main, renderSystemdUnit } from "../src/cli.js";
+import { main, renderSystemdUnit, resolveCommand } from "../src/cli.js";
 import { resolveBridgePaths } from "../src/paths.js";
 
 const originalHome = process.env.HOME;
@@ -28,6 +28,9 @@ try {
   assert.ok(existsSync(path.join(defaultProject, "AGENTS.md")));
   assert.equal(statSync(path.join(defaultProject, "AGENTS.md")).mode & 0o777, 0o600);
   const first = readFileSync(paths.configFile, "utf8");
+  const codexBin = resolveCommand("codex");
+  assert.ok(path.isAbsolute(codexBin), "test requires Codex CLI on PATH");
+  assert.match(first, new RegExp(`CODEX_BIN=${codexBin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   assert.match(first, new RegExp(`PROJECT_CREATE_ROOT=${paths.projectsRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   assert.match(first, new RegExp(`PROJECT_ALLOWLIST=${defaultProject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   assert.match(first, new RegExp(`PROJECT_COMMANDS=${projectName}=${defaultProject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));

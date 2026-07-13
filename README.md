@@ -25,6 +25,11 @@ codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
 
+During setup, the installer resolves Codex CLI to an absolute path and stores it as
+`CODEX_BIN`. This keeps the service working under systemd even when Codex was
+installed in a user-local directory that is not part of the systemd user manager's
+default `PATH`.
+
 For automation, keep the bot token in a mode-0600 file rather than a command-line argument:
 
 ```bash
