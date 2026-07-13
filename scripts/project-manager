@@ -4,7 +4,8 @@ import path from "node:path";
 import { resolveBridgePaths } from "../src/paths.js";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-const ENV_FILE = resolveBridgePaths().configFile;
+const BRIDGE_PATHS = resolveBridgePaths();
+const ENV_FILE = BRIDGE_PATHS.configFile;
 
 try {
   main();
@@ -129,14 +130,14 @@ function main() {
     if (!alias) throw new Error("Project name must contain letters, numbers, underscore, or dash.");
     const project = commands.get(alias);
     if (!project) throw new Error(`Project command not found: /${alias}`);
-    assertInside(createRoot, project);
 
     for (const [commandAlias, commandProject] of commands.entries()) {
       if (path.resolve(commandProject) === path.resolve(project)) commands.delete(commandAlias);
     }
     const remainingProjects = projects.filter(item => path.resolve(item) !== path.resolve(project));
     if (remainingProjects.length === 0) throw new Error("Cannot delete the last allowed project.");
-    rmSync(project, { recursive: true, force: true });
+    const folderRemoved = isInside(BRIDGE_PATHS.projectsRoot, project);
+    if (folderRemoved) rmSync(project, { recursive: true, force: true });
     writeProjectEnv(env, remainingProjects, commands, createRoot);
     return print({
       ok: true,
@@ -144,7 +145,7 @@ function main() {
       alias,
       project,
       removedFromAllowlist: remainingProjects.length !== projects.length,
-      folderRemoved: true,
+      folderRemoved,
       createRoot,
       projects: remainingProjects,
       projectCommands: Object.fromEntries(commands),
@@ -254,10 +255,14 @@ function inferCreateRoot(projects) {
 }
 
 function assertInside(root, target) {
-  const relative = path.relative(root, target);
-  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+  if (!isInside(root, target)) {
     throw new Error(`Project path must be inside create root: ${root}`);
   }
+}
+
+function isInside(root, target) {
+  const relative = path.relative(root, target);
+  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
 function defaultAgentsMd(alias) {

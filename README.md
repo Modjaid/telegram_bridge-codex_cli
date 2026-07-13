@@ -123,7 +123,7 @@ scripts/project-manager detach --name <projectAlias>
 scripts/project-manager delete --name <projectName>
 ```
 
-Creation updates the active Bridge config (`~/.codex-telegram-bridge/config.env` when installed), creates the project directory under `PROJECT_CREATE_ROOT`, adds it to `PROJECT_ALLOWLIST` and `PROJECT_COMMANDS`, and creates an `AGENTS.md` file in the new project. Deletion recursively removes the project folder under `PROJECT_CREATE_ROOT`, then removes it from the bridge configuration.
+Creation updates the active Bridge config (`~/.codex-telegram-bridge/config.env` when installed), creates the project directory under `PROJECT_CREATE_ROOT`, adds it to `PROJECT_ALLOWLIST` and `PROJECT_COMMANDS`, and creates an `AGENTS.md` file in the new project. Deletion always removes the project from the Bridge configuration. It recursively removes the folder only when it is inside the default Bridge projects directory (`~/.codex-telegram-bridge/projects`); attached folders elsewhere are preserved.
 
 ## Scheduled Codex Tasks
 
