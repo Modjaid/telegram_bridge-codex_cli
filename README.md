@@ -112,7 +112,7 @@ Examples:
 
 Using any project command clears the saved Codex thread, pending answer mode, and bridge history for the global Telegram session, even when the command selects the already active project. Follow-up plain text messages continue in the selected project until another project command is used.
 
-Telegram `/projects` also shows `/delete_<project>` under each project and an inline `Create new project` button. Pressing the button sends a reply-only prompt for the new project name and shows the parent directory where the folder will be created. The user must reply to that prompt; a normal message is routed to the current Codex session.
+Telegram `/projects` also shows `/delete_<project>` under each project and an inline `Create new project` button. Pressing the button sends an English-language `ForceReply` prompt for the new project name, opens Telegram's reply input with `your_project_name` as the placeholder, and shows the parent directory where the folder will be created. The user must reply to that prompt; a normal message is routed to the current Codex session.
 
 Project create/delete operations go through:
 

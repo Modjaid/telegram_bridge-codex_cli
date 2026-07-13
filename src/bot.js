@@ -206,15 +206,23 @@ async function handleCallback(query) {
     await answerCallback(query.id, "Project name requested");
     const root = config.projectCreateRoot;
     const prompt = [
-      "Введите имя нового project.",
+      "Enter a name for the new project.",
       "",
-      `Папка будет создана внутри:\n${root}`,
+      `The folder will be created inside:\n${root}`,
       "",
-      "Ответьте именно на это сообщение. Если отправить имя обычным сообщением, оно уйдёт в текущую Codex-сессию.",
+      "Reply to this message. If you send the name as a regular message, it will go to the current Codex session.",
       "",
-      "Разрешены латинские буквы, цифры, подчёркивание и дефис.",
+      "Use Latin letters, numbers, underscores, or hyphens.",
+      "Example: your_project_name",
     ].join("\n");
-    const requestMessage = await sendMessage(chatId, prompt, telegramReplyExtra(query.message?.message_id));
+    const requestMessage = await sendMessage(chatId, prompt, {
+      ...telegramReplyExtra(query.message?.message_id),
+      reply_markup: {
+        force_reply: true,
+        selective: true,
+        input_field_placeholder: "your_project_name",
+      },
+    });
     rememberPendingProjectCreate(chatId, requestMessage.message_id);
     return;
   }
@@ -488,7 +496,7 @@ async function handleMessage(message) {
     try {
       replyInboxContext = await getReplyInboxContext(session, message);
     } catch (error) {
-      await sendBridgeMessage(target, `Файл из reply не найден в Inbox: ${error.message}`);
+      await sendBridgeMessage(target, `The file from the reply was not found in Inbox: ${error.message}`);
       return;
     }
   }
@@ -861,7 +869,7 @@ function formatScheduleTaskList(chatId, currentProject) {
   if (!tasks.length) {
     return [
       header,
-      "Нет задач для этого project.",
+      "No tasks for this project.",
     ].join("\n");
   }
   return [
@@ -873,11 +881,11 @@ function formatScheduleTaskList(chatId, currentProject) {
 
 function formatScheduleTaskSummary(task, now = new Date()) {
   return [
-    `${task.title || task.name}: ${task.description || "без описания"}`,
-    `Запуск: ${formatHumanSchedule(task, now)}`,
-    task.status === "disabled" || !task.enabled ? "Отключена" : "",
-    `Изменить: /edit_task_${task.id}`,
-    `Удалить: /delete_task_${task.id}`,
+    `${task.title || task.name}: ${task.description || "no description"}`,
+    `Run: ${formatHumanSchedule(task, now)}`,
+    task.status === "disabled" || !task.enabled ? "Disabled" : "",
+    `Edit: /edit_task_${task.id}`,
+    `Delete: /delete_task_${task.id}`,
   ].filter(Boolean).join("\n");
 }
 
@@ -906,7 +914,7 @@ function formatScheduleTaskDetails(task, now = new Date()) {
 }
 
 function formatHumanSchedule(task, now = new Date()) {
-  if (task.status === "disabled" || !task.enabled) return "отключена";
+  if (task.status === "disabled" || !task.enabled) return "disabled";
   const simple = simpleCronText(task.cron);
   if (simple) return simple;
   const nextRun = task.nextRunAt || nextCronRun(task.cron, task.timeZone, now)?.toISOString() || "";
@@ -918,8 +926,8 @@ function simpleCronText(cron) {
   const [minute, hour, dayOfMonth, month, dayOfWeek] = String(cron || "").trim().split(/\s+/);
   if (!/^\d+$/.test(minute) || !/^\d+$/.test(hour)) return "";
   const time = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-  if (dayOfMonth === "*" && month === "*" && dayOfWeek === "*") return `каждый день в ${time}`;
-  if (dayOfMonth === "*" && month === "*" && ["1-5", "1,2,3,4,5"].includes(dayOfWeek)) return `по будням в ${time}`;
+  if (dayOfMonth === "*" && month === "*" && dayOfWeek === "*") return `every day at ${time}`;
+  if (dayOfMonth === "*" && month === "*" && ["1-5", "1,2,3,4,5"].includes(dayOfWeek)) return `weekdays at ${time}`;
   return "";
 }
 
@@ -930,9 +938,9 @@ function formatRelativeZonedDate(date, timeZone, now = new Date()) {
   const currentDay = Date.UTC(current.year, current.month - 1, current.day);
   const dayDiff = Math.round((targetDay - currentDay) / 86400000);
   const time = `${String(target.hour).padStart(2, "0")}:${String(target.minute).padStart(2, "0")}`;
-  if (dayDiff === 0) return `сегодня в ${time}`;
-  if (dayDiff === 1) return `завтра в ${time}`;
-  return `${String(target.day).padStart(2, "0")}.${String(target.month).padStart(2, "0")}.${target.year} в ${time}`;
+  if (dayDiff === 0) return `today at ${time}`;
+  if (dayDiff === 1) return `tomorrow at ${time}`;
+  return `${String(target.day).padStart(2, "0")}.${String(target.month).padStart(2, "0")}.${target.year} at ${time}`;
 }
 
 function zonedPartsForBot(date, timeZone) {
@@ -973,7 +981,7 @@ function buildSchedulePrompt(session, userText, command = {}) {
     "- Ask a confirmation question only when required details are ambiguous, missing, risky, or the user is asking to delete a task.",
     "- Before deleting a task, ask for explicit confirmation. Delete only after confirmation.",
     "- If a selected task is present, treat follow-up messages as edits to that task unless the user clearly switches context. Do not say you lack access to tasks; the selected task and existing tasks are provided below.",
-    "- For relative schedule edits, interpret `forward`, `later`, `вперёд`, `позже`, and `через` as moving the run later. For example, `на две минуты вперёд` means add 2 minutes to the selected task's cron time. Use `schedule-task patch` immediately when the edit is clear.",
+    "- For relative schedule edits, interpret `forward`, `later`, and `in` as moving the run later. For example, `two minutes later` means add 2 minutes to the selected task's cron time. Use `schedule-task patch` immediately when the edit is clear.",
     "- If the user's time zone is unknown, ask for it before saving the first task. Save it with `schedule-task set-timezone --chat-id ... --timezone ...` once known.",
     "- Use IANA time zones such as Europe/Berlin or America/New_York.",
     "- Bind new tasks to the current Telegram project shown below unless the user explicitly chooses another allowed project.",
@@ -2533,13 +2541,13 @@ async function getReplyInboxContext(session, message) {
   const found = findReplyMediaRecord(config.mediaCacheRoot, replyMessage) || findLegacyReplyMediaRecord(replyMessage);
   if (!found) {
     if (!getInboxAttachment(replyMessage) && !parseMediaId(replyMessage.caption || replyMessage.text || "")) return null;
-    throw new Error("запись для этого Telegram-сообщения отсутствует");
+    throw new Error("no record exists for this Telegram message");
   }
 
   const inboxPath = resolvedReplyMediaPath(found.item, found.project);
   if (!inboxPath || !existsSync(inboxPath)) {
-    if (found.item.file?.expiredAt) throw new Error("файл удалён из недельного кэша и не был сохранён проектом; отправьте его повторно");
-    throw new Error(found.item.file?.relativePath || found.item.file?.path || "локальный файл отсутствует");
+    if (found.item.file?.expiredAt) throw new Error("the file was removed from the seven-day cache and was not saved by the project; send it again");
+    throw new Error(found.item.file?.relativePath || found.item.file?.path || "the local file is missing");
   }
 
   return { record: found.item, path: inboxPath };
@@ -2926,7 +2934,7 @@ function parseBool(value) {
 function looksLikeQuestion(text) {
   const normalized = text.trim();
   if (normalized.endsWith("?")) return true;
-  return /\b(please confirm|which option|do you want|should i|need your|choose|уточн|подтверд|какой вариант|как поступить|выбери|нужно ли)\b/i.test(normalized);
+  return /\b(please confirm|which option|do you want|should i|need your|choose)\b/i.test(normalized);
 }
 
 function clean(value) {
