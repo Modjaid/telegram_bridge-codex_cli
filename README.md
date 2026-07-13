@@ -33,6 +33,8 @@ codex-telegram-bridge setup --token-file /secure/path/bot-token --user-id 123456
 
 Installed code is managed by npm. Configuration, projects, state, logs, and temporary Bridge data are kept under `~/.codex-telegram-bridge/`; Codex credentials in `~/.codex/` and Google Workspace MCP credentials are independent and are never copied or removed by Bridge.
 
+On first configuration, the Bridge creates a default project named after the Linux user under the hidden Bridge data directory, creates a matching slash command (for example `/ksu` for `~/.codex-telegram-bridge/projects/ksu`), and creates the project's `AGENTS.md`. Existing project settings and existing instructions are preserved.
+
 Useful lifecycle commands are `start`, `stop`, `restart`, `status`, `doctor`, `login`, `add-user`, `update`, and `uninstall`. Ordinary uninstall disables the user service but preserves data. `uninstall --purge --yes` also removes `~/.codex-telegram-bridge`, but never Codex or Google credentials.
 
 To migrate an existing checkout without deleting it:
@@ -121,7 +123,7 @@ scripts/project-manager detach --name <projectAlias>
 scripts/project-manager delete --name <projectName>
 ```
 
-Creation updates the active Bridge config (`~/.codex-telegram-bridge/config.env` when installed), creates the project directory under `PROJECT_CREATE_ROOT`, adds it to `PROJECT_ALLOWLIST` and `PROJECT_COMMANDS`, and creates an `AGENTS.md` file in the new project. Deletion recursively removes the project folder under `PROJECT_CREATE_ROOT`, then removes it from the bridge configuration.
+Creation updates the active Bridge config (`~/.codex-telegram-bridge/config.env` when installed), creates the project directory under `PROJECT_CREATE_ROOT`, adds it to `PROJECT_ALLOWLIST` and `PROJECT_COMMANDS`, and creates an `AGENTS.md` file in the new project. Deletion always removes the project from the Bridge configuration. It recursively removes the folder only when it is inside the default Bridge projects directory (`~/.codex-telegram-bridge/projects`); attached folders elsewhere are preserved.
 
 ## Scheduled Codex Tasks
 
