@@ -33,6 +33,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 - Register persistent project artifacts with `scripts/media-event complete`; do not hand-edit the shared `.media-index.json`.
 - Keep bundled skill `VERSION` files in sync with material skill changes; startup must preserve an installed version newer than the bundle.
 - Telegram voice prompts reuse the STT progress message as the Codex live progress log to avoid extra `Transcribed` chat messages.
+- STT conversion normalizes speech loudness by default (`STT_NORMALIZE_AUDIO=true`) before producing the mono 16 kHz WAV; deployments can disable it without changing the transcriber.
 - If behavior, config, project handling, service setup, or media flow changes, update this file in the same change.
 
 ## Run/Check

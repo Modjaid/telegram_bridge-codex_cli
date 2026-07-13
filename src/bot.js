@@ -62,6 +62,7 @@ const config = {
   maxTelegramChars: Number(process.env.MAX_TELEGRAM_CHARS || 3900),
   sttCommand: process.env.STT_COMMAND || "",
   sttTimeoutMs: Number(process.env.STT_TIMEOUT_MS || 120000),
+  sttNormalizeAudio: parseBool(process.env.STT_NORMALIZE_AUDIO || "true"),
   maxAudioBytes: Number(process.env.MAX_AUDIO_BYTES || 20000000),
   maxInboxFileBytes: Number(process.env.MAX_INBOX_FILE_BYTES || 50000000),
   mediaCacheRoot: resolveMediaCacheRoot(),
@@ -2254,7 +2255,10 @@ async function handleAudioMessage(target, session, audio, inboxPath = "", inboxR
       label: "audio",
     });
     const wavPath = path.join(tempDir, "audio.wav");
-    await runProcess("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", "-i", sourcePath, "-ar", "16000", "-ac", "1", wavPath], {
+    const ffmpegArgs = ["-hide_banner", "-loglevel", "error", "-y", "-i", sourcePath];
+    if (config.sttNormalizeAudio) ffmpegArgs.push("-af", "loudnorm=I=-16:LRA=11:TP=-1.5");
+    ffmpegArgs.push("-ar", "16000", "-ac", "1", wavPath);
+    await runProcess("ffmpeg", ffmpegArgs, {
       cwd: ROOT,
       timeoutMs: config.sttTimeoutMs,
     });

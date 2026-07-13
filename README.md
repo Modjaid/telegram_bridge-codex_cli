@@ -250,6 +250,7 @@ Optional STT settings:
 
 ```bash
 STT_TIMEOUT_MS=120000
+STT_NORMALIZE_AUDIO=true
 MAX_AUDIO_BYTES=20000000
 LOCAL_WHISPER_DEVICE=cpu
 LOCAL_WHISPER_COMPUTE_TYPE=int8
@@ -258,6 +259,8 @@ LOCAL_WHISPER_LOCAL_FILES_ONLY=true
 LOCAL_WHISPER_VAD=true
 LOCAL_WHISPER_BEAM_SIZE=5
 ```
+
+`STT_NORMALIZE_AUDIO=true` applies EBU R128 loudness normalization before transcription. This raises quiet speech while limiting peaks; set it to `false` to keep the source level unchanged.
 
 An OpenAI-compatible fallback script is also available at `scripts/transcribe-openai.js`, but the default setup is local `faster-whisper`.
 
