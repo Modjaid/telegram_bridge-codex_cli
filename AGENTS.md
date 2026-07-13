@@ -24,6 +24,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 
 - Use existing no-dependency Node style; package requires Node `>=22`.
 - Installed deployments use `~/.codex-telegram-bridge/config.env`; projects, state and logs live under that persistent data root and never under the npm package. `PROJECT_ALLOWLIST` is the comma-separated list of allowed absolute paths, and `PROJECT_COMMANDS` maps slash aliases to paths from that allowlist.
+- Install and update this Bridge from `github:Modjaid/telegram_bridge-codex_cli`; the same unscoped package name on the public npm registry belongs to a different project. Keep the package private to prevent accidental registry publication.
 - First-time configuration creates a username-named default project under `~/.codex-telegram-bridge/projects`, maps the username slash alias to it, and creates its `AGENTS.md` without replacing existing instructions.
 - First-time configuration resolves Codex CLI from the interactive setup environment and persists its absolute path as `CODEX_BIN`; the systemd service must not depend on user-local bin directories being present in the user manager's `PATH`.
 - First-time configuration enables `CODEX_SKIP_GIT_REPO_CHECK=true` because the generated default project is not initialized as a Git repository; users may opt back into the repository check after initializing Git.
