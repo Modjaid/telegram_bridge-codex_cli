@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Telegram Bridge"
+  short_description: "Manage Bridge projects and Telegram media"
+  default_prompt: "Use $codex-telegram-bridge to manage a Bridge project or configure Telegram media handling."

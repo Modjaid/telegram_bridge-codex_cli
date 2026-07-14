@@ -2,14 +2,38 @@ import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync } from 
 import { homedir } from "node:os";
 import path from "node:path";
 
+const DEFAULT_SKILLS = ["codex-telegram-bridge"];
+const RETIRED_SKILLS = new Map([
+  ["configure-telegram-media", "1.1.0"],
+  ["manage-telegram-projects", "1.1.0"],
+]);
+
 export function installBundledSkills(root, options = {}) {
   const sourceRoot = path.join(root, "bundled-skills");
   if (!existsSync(sourceRoot)) return [];
   const codexHome = path.resolve(options.codexHome || process.env.CODEX_HOME || path.join(homedir(), ".codex"));
   const skillsRoot = path.join(codexHome, "skills");
   mkdirSync(skillsRoot, { recursive: true, mode: 0o700 });
-  const names = options.names || ["configure-telegram-media", "manage-telegram-projects"];
-  return names.map(name => installOne(sourceRoot, skillsRoot, name));
+  const names = options.names || DEFAULT_SKILLS;
+  const results = names.map(name => installOne(sourceRoot, skillsRoot, name));
+  if (options.retireLegacy !== false) {
+    for (const [name, lastBundledVersion] of RETIRED_SKILLS) {
+      const result = retireOne(skillsRoot, name, lastBundledVersion);
+      if (result) results.push(result);
+    }
+  }
+  return results;
+}
+
+function retireOne(skillsRoot, name, lastBundledVersion) {
+  const destination = path.join(skillsRoot, name);
+  if (!existsSync(destination)) return null;
+  const installedVersion = readVersion(destination);
+  if (compareVersions(installedVersion, lastBundledVersion) > 0) {
+    return { name, action: "preserved-newer", version: installedVersion };
+  }
+  rmSync(destination, { recursive: true, force: true });
+  return { name, action: "retired", version: installedVersion, replacement: "codex-telegram-bridge" };
 }
 
 function installOne(sourceRoot, skillsRoot, name) {

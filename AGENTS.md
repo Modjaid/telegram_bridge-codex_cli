@@ -39,6 +39,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 - Telegram media is downloaded once into the shared seven-day XDG cache (`$XDG_CACHE_HOME/codex-telegram-bridge/telegram-media`, or `~/.cache/...`; override with `TELEGRAM_MEDIA_CACHE_ROOT`). Project-specific processing belongs in `.codex/skills/*/telegram-media-trigger.json` plus that skill's scripts; reply resolution must never rerun triggers or STT.
 - Register persistent project artifacts with `scripts/media-event complete`; do not hand-edit the shared `.media-index.json`.
 - Keep bundled skill `VERSION` files in sync with material skill changes; startup must preserve an installed version newer than the bundle.
+- `codex-telegram-bridge` is the single bundled skill for project lifecycle and Telegram media workflows. The installer retires the former split skills only through their last bundled version (`1.1.0`) and preserves newer user-maintained versions.
 - Telegram voice prompts reuse the STT progress message as the Codex live progress log to avoid extra `Transcribed` chat messages.
 - STT conversion normalizes speech loudness by default (`STT_NORMALIZE_AUDIO=true`) before producing the mono 16 kHz WAV; deployments can disable it without changing the transcriber.
 - If behavior, config, project handling, service setup, or media flow changes, update this file in the same change.

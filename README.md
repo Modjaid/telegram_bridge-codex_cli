@@ -210,7 +210,7 @@ You can also connect CollabMD, a convenient tool for working with Markdown files
 
 ## Shared Media Cache And Project Triggers
 
-On startup Bridge installs the bundled `configure-telegram-media` and `manage-telegram-projects` skills into `$CODEX_HOME/skills` (or `~/.codex/skills`). A missing skill is installed, an older `VERSION` is atomically upgraded, and an equal or newer installed version is preserved. The media skill explains the seven-day cache and helps Codex create project-local trigger skills, creating or attaching a missing target project through the project workflow when needed. The project skill derives a valid slash alias, creates or attaches folders through `scripts/project-manager`, registers them for `/projects`, ensures each project has an `AGENTS.md`, and offers to add project instructions after creation.
+On startup Bridge installs the bundled `codex-telegram-bridge` skill into `$CODEX_HOME/skills` (or `~/.codex/skills`). A missing skill is installed, an older `VERSION` is atomically upgraded, and an equal or newer installed version is preserved. The skill derives valid project slash aliases, creates or attaches projects through `scripts/project-manager`, manages project `AGENTS.md` instructions, explains the seven-day Telegram media cache, and creates project-local media trigger skills. During migration, bundled versions up to `1.1.0` of the former `configure-telegram-media` and `manage-telegram-projects` skills are removed; newer user-maintained versions are preserved.
 
 Telegram media is downloaded once into the shared cache configured by:
 
