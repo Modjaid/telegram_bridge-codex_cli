@@ -168,6 +168,8 @@ scripts/project-manager delete --name <projectName>
 
 Creation updates the active Bridge config (`~/.codex-telegram-bridge/config.env` when installed), creates the project directory under `PROJECT_CREATE_ROOT`, adds it to `PROJECT_ALLOWLIST` and `PROJECT_COMMANDS`, and creates an `AGENTS.md` file in the new project. Deletion always removes the project from the Bridge configuration. It recursively removes the folder only when it is inside the default Bridge projects directory (`~/.codex-telegram-bridge/projects`); attached folders elsewhere are preserved.
 
+The running Telegram adapter refreshes this project configuration before parsing slash commands and project callbacks. Projects created, attached, detached, or deleted with `scripts/project-manager` therefore become visible without restarting the Bridge.
+
 ## Scheduled Codex Tasks
 
 Telegram `/schedule` opens a special Codex session in the bridge's own service directory, not in a user project. The session receives schedule-specific instructions and can help create, edit, or delete cron tasks through dialog.

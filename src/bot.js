@@ -194,6 +194,7 @@ async function handleCallback(query) {
   }
 
   const data = query.data || "";
+  if (data.startsWith("project:")) await refreshProjectConfig();
   const callbackSessionKey = query.message?.message_id ? findTelegramSessionKeyByMessage(chatId, query.message.message_id) : "";
   const target = telegramTarget(chatId, callbackSessionKey || getActiveTelegramSessionKey(chatId));
   const session = getSession(target.key);
@@ -391,6 +392,8 @@ async function handleMessage(message) {
   const voicePrompt = Boolean(message.voice?.file_id);
   const inboxAttachment = getInboxAttachment(message);
   if (!text && !audio && !jsonDocument && !inboxAttachment) return;
+
+  if (text.startsWith("/")) await refreshProjectConfig();
 
   if (text && await handlePendingProjectCreateReply(message, text)) return;
 
@@ -2769,6 +2772,14 @@ async function runProjectManager(command, args = []) {
     return JSON.parse(result.stdout);
   } catch {
     throw new Error(`project-manager returned invalid JSON: ${clean(result.stdout).slice(0, 500)}`);
+  }
+}
+
+async function refreshProjectConfig() {
+  try {
+    applyProjectManagerResult(await runProjectManager("list"));
+  } catch (error) {
+    console.warn(`Project config refresh failed; keeping the current in-memory list: ${error.message}`);
   }
 }
 
