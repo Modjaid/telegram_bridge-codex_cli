@@ -1,6 +1,6 @@
 ---
 name: configure-telegram-media
-description: Configure or explain Telegram media handling for Codex Telegram Bridge projects. Use when a user asks where Telegram files are stored, how long they remain available, how to catch or process uploads, or requests project-specific handlers for PDFs, APKs, images, audio, video, documents, archives, MIME types, extensions, one project, several projects, or all projects.
+description: Configure or explain Telegram media handling for Codex Telegram Bridge projects, including creating or attaching a missing target project before configuring its handler. Use when a user asks where Telegram files are stored, how long they remain available, how to catch or process uploads, or requests project-specific handlers for PDFs, APKs, images, audio, video, documents, archives, MIME types, extensions, one project, several projects, or all projects.
 ---
 
 # Configure Telegram Media
@@ -23,15 +23,16 @@ Do not create a handler when the user only asks a conceptual question.
 
 When the requested behavior is sufficiently clear:
 
-1. Identify the target project and read its applicable `AGENTS.md` files.
-2. Create or update `<project>/.codex/skills/<skill-name>/`.
-3. Put agent guidance in `SKILL.md`, runtime subscriptions in `telegram-media-trigger.json`, and executable logic under `scripts/`.
-4. Select projects and file matching rules from the user's request. Do not silently subscribe to `*` when the user named one project.
-5. Make the handler read one JSON payload from stdin and emit one JSON object on stdout. Send diagnostics to stderr.
-6. Return persistent files as `artifacts`; keep every artifact inside the source project unless the user explicitly authorizes another destination.
-7. Make processing idempotent for the same `mediaId`.
-8. Validate the manifest with `scripts/validate-trigger.mjs <manifest-path>` from this skill.
-9. Test the handler with a representative payload without using a real Telegram secret.
+1. Identify the target project. If the user also asks to create or attach it, follow the sibling `manage-telegram-projects` skill first. Register it through `scripts/project-manager`, ensure `AGENTS.md` exists, report the derived slash command, and offer to add project instructions after creation. Never create an unregistered project folder directly.
+2. Read the target project's applicable `AGENTS.md` files.
+3. Create or update `<project>/.codex/skills/<skill-name>/`.
+4. Put agent guidance in `SKILL.md`, runtime subscriptions in `telegram-media-trigger.json`, and executable logic under `scripts/`.
+5. Select projects and file matching rules from the user's request. Do not silently subscribe to `*` when the user named one project.
+6. Make the handler read one JSON payload from stdin and emit one JSON object on stdout. Send diagnostics to stderr.
+7. Return persistent files as `artifacts`; keep every artifact inside the source project unless the user explicitly authorizes another destination.
+8. Make processing idempotent for the same `mediaId`.
+9. Validate the manifest with `scripts/validate-trigger.mjs <manifest-path>` from this skill.
+10. Test the handler with a representative payload without using a real Telegram secret.
 
 Read [references/trigger-contract.md](references/trigger-contract.md) before creating or changing a manifest or handler.
 
