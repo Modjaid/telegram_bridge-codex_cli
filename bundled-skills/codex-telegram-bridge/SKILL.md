@@ -1,6 +1,6 @@
 ---
 name: codex-telegram-bridge
-description: Manage Codex Telegram Bridge projects and Telegram media handling. Use when a user asks to create, attach, register, activate, list, or choose a Bridge project; create or update project AGENTS.md instructions; explain Telegram file storage or retention; or configure project handlers for PDFs, APKs, images, audio, video, documents, archives, MIME types, extensions, one project, several projects, or all projects.
+description: Manage Codex Telegram Bridge projects and Telegram media handling. Use when a user asks to create, attach, register, activate, list, choose, detach, or delete a Bridge project; create or update project AGENTS.md instructions; explain Telegram file storage or retention; or configure project handlers for PDFs, APKs, images, audio, video, documents, archives, MIME types, extensions, one project, several projects, or all projects.
 ---
 
 # Codex Telegram Bridge
@@ -9,7 +9,7 @@ Keep Bridge project registration, project instructions, and Telegram media handl
 
 ## Choose the workflow
 
-- For project creation, attachment, registration, activation, or instructions, follow **Manage projects**.
+- For project creation, attachment, registration, activation, deletion, or instructions, follow **Manage projects**.
 - For file storage questions or upload handlers, follow **Handle Telegram media**.
 - When a media request needs a missing project, complete the project workflow first and then continue with the media workflow.
 
@@ -19,7 +19,7 @@ Keep Bridge project registration, project instructions, and Telegram media handl
 
 Identify the Linux user whose Bridge owns the project. Prefer the user running the relevant Bridge service; this machine may host several users.
 
-Ask whether to create a new project or attach an existing folder only when the intent is ambiguous. Use a supplied project name without asking again. Ask for a name only when none was supplied.
+When the user says only “add a project” or equivalent, always ask whether to create a new project or attach a folder that already exists on the machine. Do not ask this again when the user explicitly said “create a new project” or “attach/connect this existing folder.” Use a supplied project name without asking again; ask for a name only when none was supplied.
 
 For an existing project, inspect its `AGENTS.md` and never replace existing instructions without explicit approval. For a new project, do not delay creation to ask about instructions: ensure `AGENTS.md` exists, then offer to add instructions afterward.
 
@@ -54,6 +54,31 @@ Confirm the absolute folder and desired alias, then use:
 ```
 
 The folder must already exist. Preserve its `AGENTS.md`; the manager creates a default file only when none exists.
+
+### Remove a project
+
+Treat every removal request as destructive and pause before changing anything. Resolve the alias and absolute folder with `project-manager list`, show both to the user, and always ask them to choose explicitly:
+
+1. Remove only the slash command and Bridge registration, preserving the folder and all files.
+2. Remove the registration and delete the entire project folder with all of its contents.
+
+Do not infer the choice from a vague word such as “remove” or “delete,” and do not proceed until the user answers.
+
+For command-only removal, use:
+
+```bash
+<bridge>/scripts/project-manager detach --name <project_alias>
+```
+
+For complete deletion, use:
+
+```bash
+<bridge>/scripts/project-manager delete --name <project_alias>
+```
+
+The manager recursively deletes folders only inside the Bridge-managed projects root. For an attached folder outside that root, explain that `delete` removes only its registration and preserves the folder. Deleting that external folder requires a separate explicit confirmation of its absolute path; never silently use `rm` to bypass the manager's protection.
+
+After either operation, run `project-manager list` again and verify that the alias and path are no longer registered. For full deletion inside the managed root, also verify that the folder no longer exists.
 
 ### Verify the project
 
