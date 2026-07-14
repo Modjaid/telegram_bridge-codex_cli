@@ -519,7 +519,10 @@ async function handleMessage(message) {
   });
   saveState();
 
-  if (session.scheduleMode) {
+  // Slash commands always belong to the Bridge command router, even when the
+  // active session is the special schedule dialog. This lets users leave that
+  // dialog with commands such as /projects instead of sending them to Codex.
+  if (session.scheduleMode && !text.startsWith("/")) {
     clearPendingScheduleSession(chatId);
     await runCodex(target, buildSchedulePrompt(session, text, {
       action: session.scheduleAction || "dialog",
