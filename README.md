@@ -1,236 +1,252 @@
-# Codex Bridge
+# Codex Telegram Bridge
 
-Minimal multi-adapter bridge for Codex CLI.
+Run Codex CLI from Telegram, switch between projects with one command, continue old sessions by replying to their messages, process uploaded files with project-specific handlers, and keep scheduled tasks running on a Linux server.
 
-It runs `codex exec --json`, parses JSONL events, and mirrors progress, tool activity, and final responses back to the originating adapter. It uses no npm dependencies.
+The Bridge runs `codex exec --json`, turns Codex JSONL events into readable progress updates, and returns tool activity and final answers to the originating chat. It has no runtime npm dependencies.
 
-Adapters:
+## What it gives you
 
-- Telegram long polling
-- CollabMD-compatible HTTP adapter
+- **Simple setup:** install one package and run `codex-telegram-bridge setup`.
+- **Telegram sessions:** start a fresh thread with `/new` or return to an older project session by replying to one of its messages.
+- **Fast project switching:** `/notes`, `/work`, or another project command changes the active workspace immediately.
+- **Parallel work:** start work in another project while Codex is still running in the first one.
+- **Visible skills:** when a project opens, Bridge lists the global and project-local skills available to Codex.
+- **Voice messages:** local `faster-whisper` transcription works without sending audio to an external transcription API.
+- **Media workflows:** uploads are cached once and can trigger handlers owned by one or more projects.
+- **Persistent schedules:** `/schedule` creates Codex tasks that survive Bridge restarts.
+- **Optional CollabMD adapter:** use the same Bridge with a CollabMD-compatible HTTP client.
 
-The bridge listens to every adapter message and stores per-session dialog history, but it starts Codex only when a message matches a configured bridge command.
+## Quick start
 
-For CollabMD-only mode, set `TELEGRAM_ADAPTER_ENABLED=false` and `COLLABMD_ADAPTER_ENABLED=true`. In that mode `BOT_TOKEN` and `ALLOWED_USER_IDS` are not required.
+### Requirements
 
-## Install and setup
+- Linux
+- Node.js 22+
+- npm
+- A Telegram bot token from `@BotFather`
+- Python 3 with venv support and `ffmpeg` when local speech-to-text is enabled
 
-Requirements: Linux, Node.js 22+, and npm. Local STT additionally requires Python 3
-with venv support and ffmpeg. Codex CLI and the Python `faster-whisper` package are
-detected and installed by `setup` when missing.
-
-Install directly from GitHub, then run the interactive setup:
+Install directly from this GitHub repository:
 
 ```bash
-npm install -g github:Modjaid/telegram_bridge-codex_cli
+npm install -g github:Modjaid/telegram_bridge-codex_cli#v0.1.5
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
 
-During setup, the installer resolves Codex CLI to an absolute path and stores it as
-`CODEX_BIN`. This keeps the service working under systemd even when Codex was
-installed in a user-local directory that is not part of the systemd user manager's
-default `PATH`.
+Interactive `setup`:
 
-`setup` is dependency-aware: it reuses an existing Codex CLI or installs
-`@openai/codex` with npm when missing. It also creates
-`~/.codex-telegram-bridge/.venv`, installs `faster-whisper`, downloads
-`Systran/faster-whisper-small`, and configures Russian CPU transcription with
-`int8`, VAD, beam size 3, and audio normalization. Python 3 with venv support and
-ffmpeg are system prerequisites; setup reports the exact missing prerequisite.
-Use `setup --skip-local-stt` to opt out of local transcription installation.
+1. Reuses an installed Codex CLI or offers to install `@openai/codex`.
+2. Checks Codex authentication and opens the normal login flow when needed.
+3. Configures the Telegram token and allowed user.
+4. Creates the default Bridge project and its slash command.
+5. Installs and prepares local `faster-whisper`, unless you opt out.
+6. Creates and starts the systemd user service.
 
-Interactive setup asks before installing a missing Codex CLI or local Whisper. It
-checks `codex login status` and launches the normal Codex login flow when required.
-The Whisper model is multilingual; the language menu selects a recognition hint
-(Russian, English, automatic detection, German, Spanish, French, Italian,
-Ukrainian, Polish, or Turkish), not a separate language download. Automation can
-use `--yes --stt-language ru` (or another ISO code, or `auto`).
-
-The default project is a regular directory rather than a Git repository, so fresh
-configurations also enable `CODEX_SKIP_GIT_REPO_CHECK=true`. Users can disable it
-after initializing the project as a trusted Git repository.
-
-Fresh configurations use `CODEX_SANDBOX=danger-full-access` so Bridge-driven Codex
-commands work on hosts without Bubblewrap and can use skills outside the project
-directory. Codex then has the same filesystem access as the Linux user running the
-Bridge. Set it to `workspace-write` when host sandboxing is installed and preferred.
-
-For automation, keep the bot token in a mode-0600 file rather than a command-line argument:
+For unattended setup, keep the bot token in a mode-`0600` file instead of passing it on the command line:
 
 ```bash
-codex-telegram-bridge setup --token-file /secure/path/bot-token --user-id 123456789 --yes
+codex-telegram-bridge setup \
+  --token-file /secure/path/bot-token \
+  --user-id 123456789 \
+  --stt-language ru \
+  --yes
 ```
 
-Installed code is managed by npm. Configuration, projects, state, logs, and temporary Bridge data are kept under `~/.codex-telegram-bridge/`; Codex credentials in `~/.codex/` and Google Workspace MCP credentials are independent and are never copied or removed by Bridge.
-
-On first configuration, the Bridge creates a default project named after the Linux user under the hidden Bridge data directory, creates a matching slash command (for example `/ksu` for `~/.codex-telegram-bridge/projects/ksu`), and creates the project's `AGENTS.md`. Existing project settings and existing instructions are preserved.
-
-Useful lifecycle commands are `start`, `stop`, `restart`, `status`, `doctor`, `login`, `add-user`, `update`, and `uninstall`. Ordinary uninstall disables the user service but preserves data. `uninstall --purge --yes` also removes `~/.codex-telegram-bridge`, but never Codex or Google credentials.
-
-To update an existing installation from the GitHub release source:
+Skip local speech recognition when it is not needed:
 
 ```bash
-npm install -g github:Modjaid/telegram_bridge-codex_cli
-codex-telegram-bridge restart
-codex-telegram-bridge doctor
+codex-telegram-bridge setup --skip-local-stt
 ```
 
-The unscoped `codex-telegram-bridge` name on the public npm registry belongs to a
-different project, so do not use `npm update -g codex-telegram-bridge` for this
-Bridge.
+## Everyday Telegram workflow
 
-To migrate an existing checkout without deleting it:
+### Commands
 
-```bash
-codex-telegram-bridge migrate --from /path/to/old/codex-telegram-bridge
-codex-telegram-bridge doctor
-```
+| Command | Purpose |
+| --- | --- |
+| `/start`, `/help` | Show help |
+| `/status` | Show the active session, project, model, sandbox, and thread |
+| `/new` | Clear the saved Codex thread for the active project session |
+| `/resume` | Show the thread that will be resumed |
+| `/stop` | Stop the current Codex run |
+| `/cancel` | Leave pending-answer mode |
+| `/projects` | List, create, switch, detach, or delete projects |
+| `/<project> [task]` | Activate a project and optionally start a task |
+| `/schedule` | Create and manage persistent scheduled tasks |
+| `/model [model]` | Show or set a model override |
+| `/sandbox [mode]` | Show or set `read-only`, `workspace-write`, or `danger-full-access` |
+| `/approval [policy]` | Show or set `untrusted`, `on-request`, `on-failure`, or `never` |
+| `/diff` | Ask Codex to summarize the current Git diff |
 
-Do not remove the old checkout until the installed service, Telegram commands, projects, schedules, Codex authorization, and optional Google MCP authorization have all been verified and a backup exists.
+### Start Codex deliberately
 
-## Development setup
-
-1. Create a bot with `@BotFather`.
-2. Copy `.env.example` to `.env`.
-3. Set:
-   - `TELEGRAM_ADAPTER_ENABLED`
-   - `BOT_TOKEN` and `ALLOWED_USER_IDS` when Telegram is enabled
-   - `PROJECT_ALLOWLIST`
-   - `PROJECT_CREATE_ROOT` if Telegram-created projects should use a specific parent directory
-   - `PROJECT_COMMANDS` if you want slash commands like `/agent` or `/notes`
-   - `BRIDGE_COMMANDS`
-4. Run:
-
-```bash
-npm run check
-npm start
-```
-
-If your selected project is not a Git repository, set `CODEX_SKIP_GIT_REPO_CHECK=true`. Keep it `false` for normal project repositories.
-
-## Commands
-
-- `/start`, `/help` - help
-- `/status` - current session status
-- `/new` - clear saved Codex thread id for this chat
-- `/resume` - resume last known thread
-- `/stop` - stop the current Codex process for this chat
-- `/cancel` - clear pending answer mode
-- `/projects` - list, switch, create, and delete projects from `PROJECT_ALLOWLIST`
-- `/schedule` - open a schedule-management Codex session for persistent cron tasks
-- `/<project> [task]` - switch global Telegram project mode and start a fresh Codex thread
-- `/model [model]` - show or set model override
-- `/sandbox [read-only|workspace-write|danger-full-access]` - show or set sandbox
-- `/approval [untrusted|on-request|on-failure|never]` - show or set Codex approval policy
-- `/diff` - ask Codex to summarize current git diff
-
-Plain text messages are saved into the adapter session history. They are not sent to Codex unless they start with one of `BRIDGE_COMMANDS`:
+Bridge records normal dialog history but starts Codex only for configured Bridge commands:
 
 ```text
 /codex summarize the current repository
-/codex --history use the recent dialog and create an implementation plan
+/codex --history use the recent dialog and create a plan
 @codex check the deployment files
 codex: inspect the vault structure
 ```
 
-Use `--history`, `--with-history`, or `-H` to include recent dialog messages in the Codex prompt. By default, Codex receives only the command task, so normal chat noise does not force the agent to re-read and re-reason over the whole conversation.
+Use `--history`, `--with-history`, or `-H` when Codex needs recent chat messages. Without that flag, the task is sent without ordinary chat noise.
 
-Telegram messages starting with other `/` commands are handled by the bridge, not blindly forwarded to shell.
+### Create and return to sessions
 
-Project slash commands are configured with `PROJECT_COMMANDS` and must point to paths from `PROJECT_ALLOWLIST`:
+- Send `/new` to make the next task start a fresh Codex thread.
+- Every project has its own Telegram session context.
+- Reply to a Bridge message from an older session to route the next message back to that session.
+- A project command starts a fresh thread for that project and makes it the active destination for subsequent plain-text messages.
 
-```bash
-PROJECT_ALLOWLIST=/home/agent,/home/agent/MyObsidian
-PROJECT_COMMANDS=agent=/home/agent,notes=/home/agent/MyObsidian
-```
+### Work in several projects
 
-Examples:
+Project aliases are ordinary Telegram slash commands:
 
 ```text
-/notes
 /notes update today's note
-/agent check bridge status
+/backend inspect the failing test
+/flight compare the itinerary options
 ```
 
-Using any project command clears the saved Codex thread, pending answer mode, and bridge history for the global Telegram session, even when the command selects the already active project. Follow-up plain text messages continue in the selected project until another project command is used.
+Switching projects does not require waiting for a run in another project to finish. Bridge prevents conflicting runs inside the same project while allowing different projects to run concurrently.
 
-Telegram `/projects` also shows `/delete_<project>` under each project and an inline `Create new project` button. Pressing the button sends an English-language `ForceReply` prompt for the new project name, opens Telegram's reply input with `your_project_name` as the placeholder, and shows the parent directory where the folder will be created. The user must reply to that prompt; a normal message is routed to the current Codex session.
+When a project session starts, Bridge reports its directory and lists available global and project-local skills, followed by a short first-level directory listing.
 
-Project create/delete operations go through:
+## Project management
 
-```bash
-scripts/project-manager create --name <projectName> --root <parentPath>
-scripts/project-manager repoint --name <projectAlias> --path <existingFolder>
-scripts/project-manager detach --name <projectAlias>
-scripts/project-manager delete --name <projectName>
-```
-
-Creation updates the active Bridge config (`~/.codex-telegram-bridge/config.env` when installed), creates the project directory under `PROJECT_CREATE_ROOT`, adds it to `PROJECT_ALLOWLIST` and `PROJECT_COMMANDS`, and creates an `AGENTS.md` file in the new project. Deletion always removes the project from the Bridge configuration. It recursively removes the folder only when it is inside the default Bridge projects directory (`~/.codex-telegram-bridge/projects`); attached folders elsewhere are preserved.
-
-The running Telegram adapter refreshes this project configuration before parsing slash commands and project callbacks. Projects created, attached, detached, or deleted with `scripts/project-manager` therefore become visible without restarting the Bridge.
-
-## Scheduled Codex Tasks
-
-Telegram `/schedule` opens a special Codex session in the bridge's own service directory, not in a user project. The session receives schedule-specific instructions and can help create, edit, or delete cron tasks through dialog.
-
-Tasks are stored persistently in:
+On first setup, Bridge creates:
 
 ```text
-~/.codex-telegram-bridge/state/schedule-tasks.json
+~/.codex-telegram-bridge/projects/<linux-user>/
 ```
 
-Each task stores an id, name/title, description, cron expression, IANA time zone, linked project, saved Codex prompt, status, last run, next run, and run count. The bridge reloads this file after restart and resumes due tasks automatically.
+It also creates `AGENTS.md` and a matching command such as `/agent` or `/ksu`.
 
-Useful commands:
+The `/projects` screen lists registered projects and provides a **Create new project** button. Project changes made by the manager are picked up before the next slash command, so adding a project does not require a Bridge restart.
+
+Use the manager for every project lifecycle operation:
+
+```bash
+scripts/project-manager list
+scripts/project-manager create --name <project-name>
+scripts/project-manager add --name <alias> --path <existing-folder>
+scripts/project-manager repoint --name <alias> --path <existing-folder>
+scripts/project-manager detach --name <alias>
+scripts/project-manager delete --name <alias>
+```
+
+The manager keeps these settings consistent:
+
+```bash
+PROJECT_CREATE_ROOT=/home/user/.codex-telegram-bridge/projects
+PROJECT_ALLOWLIST=/absolute/project/one,/absolute/project/two
+PROJECT_COMMANDS=one=/absolute/project/one,two=/absolute/project/two
+```
+
+Names are normalized to lowercase Telegram aliases; spaces and dashes become underscores. A created or attached project always has an `AGENTS.md`.
+
+Removal has two distinct meanings:
+
+- `detach` removes the command and Bridge registration while preserving the folder.
+- `delete` removes the registration and recursively deletes the folder only when it is inside the Bridge-managed projects root. Attached folders elsewhere are preserved.
+
+Never hand-edit project registration when `project-manager` can perform the operation safely.
+
+## Bundled Codex skill
+
+Bridge installs one global skill at startup:
 
 ```text
-/schedule
-/schedule every day at 9am check new GitHub issues in the current project
-/edit_task_<id>
-/delete_task_<id>
+~/.codex/skills/codex-telegram-bridge/
 ```
 
-When creating a task, the schedule session uses the currently selected Telegram project as the default project for that task. If the user switches project before creating another task, the new task is bound to the new project. On execution, Codex starts in the task's saved project.
+The skill teaches Codex how to:
 
-The schedule session asks for the user's IANA time zone before saving the first task. It also knows the bridge system time zone and calculates the current offset difference. The user time zone is persisted and reused in later `/schedule` sessions.
+- distinguish creating a new project from attaching an existing folder;
+- derive and register a valid slash alias;
+- create and update project `AGENTS.md` instructions;
+- ask whether removal means detaching the command or deleting the whole managed folder;
+- explain Telegram media storage and retention;
+- create and validate project-local media handlers.
 
-Codex runs launched by `/schedule` get `scripts/` on `PATH`, so the schedule agent can manage state with:
+The bundled skill is versioned and upgrades atomically. During migration, bundled versions up to `1.1.0` of the former `configure-telegram-media` and `manage-telegram-projects` skills are retired. Newer user-maintained versions are preserved.
+
+## Voice messages and local STT
+
+The recommended Russian configuration uses `faster-whisper` with `Systran/faster-whisper-small` on CPU in `int8` mode:
 
 ```bash
-schedule-task list --chat-id <id> --json
-schedule-task set-timezone --chat-id <id> --timezone Europe/Berlin
-schedule-task upsert --chat-id <id> --name daily_issues --title "Daily issues" --description "Check GitHub issues" --cron "0 9 * * *" --timezone Europe/Berlin --project /home/agent/project --prompt "Check new GitHub issues and summarize them." --status enabled
-schedule-task delete --chat-id <id> --name <task-name-or-id>
+STT_COMMAND=scripts/transcribe-faster-whisper
+LOCAL_WHISPER_MODEL=Systran/faster-whisper-small
+LOCAL_WHISPER_DEVICE=cpu
+LOCAL_WHISPER_COMPUTE_TYPE=int8
+LOCAL_WHISPER_LANGUAGE=ru
+LOCAL_WHISPER_VAD=true
+LOCAL_WHISPER_BEAM_SIZE=3
+STT_NORMALIZE_AUDIO=true
 ```
 
-## CollabMD
+This baseline was voice-tested successfully with:
 
-You can also connect CollabMD, a convenient tool for working with Markdown files on a VPS.
+> Шла Саша по шоссе и сосала сушку.
 
-## Shared Media Cache And Project Triggers
+Before changing the model, beam size, VAD, or normalization, compare recognition against the same recording and retain the new setting only when it materially improves the result.
 
-On startup Bridge installs the bundled `codex-telegram-bridge` skill into `$CODEX_HOME/skills` (or `~/.codex/skills`). A missing skill is installed, an older `VERSION` is atomically upgraded, and an equal or newer installed version is preserved. The skill derives valid project slash aliases, distinguishes new projects from existing folders, creates or attaches projects through `scripts/project-manager`, requires an explicit detach-versus-delete choice before removal, manages project `AGENTS.md` instructions, explains the seven-day Telegram media cache, and creates project-local media trigger skills. During migration, bundled versions up to `1.1.0` of the former `configure-telegram-media` and `manage-telegram-projects` skills are removed; newer user-maintained versions are preserved.
+Bridge downloads Telegram voice, audio, and audio-document messages, converts them to mono 16 kHz WAV with `ffmpeg`, then runs `STT_COMMAND <wav-path>`. The command may be any executable that writes transcript text to stdout.
 
-Telegram media is downloaded once into the shared cache configured by:
+Additional settings:
 
 ```bash
-# Optional; defaults to $XDG_CACHE_HOME/codex-telegram-bridge/telegram-media
+STT_TIMEOUT_MS=120000
+MAX_AUDIO_BYTES=20000000
+LOCAL_WHISPER_CPU_THREADS=4
+LOCAL_WHISPER_LOCAL_FILES_ONLY=true
+```
+
+`STT_NORMALIZE_AUDIO=true` applies EBU R128 loudness normalization to improve quiet recordings while limiting peaks. The multilingual model can use a language hint such as `ru`, `en`, `de`, `uk`, or automatic detection.
+
+An OpenAI-compatible alternative is available at `scripts/transcribe-openai.js`, but local `faster-whisper` is the default setup path.
+
+## Media cache and project triggers
+
+Every Telegram photo, image, voice message, audio file, video, animation, video note, or document is downloaded once into a shared cache:
+
+```text
+$XDG_CACHE_HOME/codex-telegram-bridge/telegram-media/
+├── .media-index.json
+└── files/<cache-entry-id>/<telegram-file-name>
+```
+
+When `XDG_CACHE_HOME` is unset, the root defaults to:
+
+```text
+~/.cache/codex-telegram-bridge/telegram-media
+```
+
+Configuration:
+
+```bash
 TELEGRAM_MEDIA_CACHE_ROOT=
 TELEGRAM_MEDIA_CACHE_TTL_DAYS=7
 TELEGRAM_MEDIA_TRIGGER_TIMEOUT_MS=120000
+MAX_INBOX_FILE_BYTES=50000000
 ```
 
-Project-specific handlers live in project-local Codex skills:
+Cached originals expire after seven days by default. Cleanup runs at startup and daily.
+
+### Project-local handlers
+
+Projects subscribe to uploads through local Codex skills:
 
 ```text
-<project>/.codex/skills/<skill>/
+<project>/.codex/skills/<handler>/
 ├── SKILL.md
 ├── telegram-media-trigger.json
 └── scripts/handle-media.js
 ```
 
-Example trigger manifest:
+One handler can subscribe to one project, several projects, or all projects:
 
 ```json
 {
@@ -238,7 +254,9 @@ Example trigger manifest:
   "subscriptions": [{
     "id": "documents",
     "projects": ["agent", "memomaker"],
-    "match": { "extensions": [".pdf", ".apk"] },
+    "match": {
+      "extensions": [".pdf", ".apk"]
+    },
     "run": "scripts/handle-media.js"
   }, {
     "id": "fallback",
@@ -250,29 +268,11 @@ Example trigger manifest:
 }
 ```
 
-The handler receives JSON on stdin and returns JSON on stdout. Returned `artifacts` must exist inside the source project. Use `media-event complete --media-id <id> --project <alias> --path <relative-path>` when an agent creates or moves an artifact manually.
+The handler reads one JSON payload from stdin and returns one JSON object on stdout. Persistent `artifacts` must already exist inside the source project.
 
-Caption text is sent to Codex in the project active when the file arrived. Voice/audio follows both paths: the original file runs matching media triggers while STT sends its transcript to Codex. Replying to a media message never reruns triggers or STT; Bridge resolves an existing project artifact first, then the shared cache. Cache files older than seven days are removed at startup and daily.
+Caption text remains associated with the upload as the user prompt. Voice and audio follow both paths: the original file runs matching triggers while STT supplies the transcript. Replying to a media message performs lookup only; it reuses a registered artifact first and the cached original second without rerunning triggers or transcription.
 
-Telegram photo/image, audio/voice, video, animation, video note, and document uploads are cached centrally. Use `MAX_INBOX_FILE_BYTES` to adjust the per-file download limit.
-
-The uploaded file content is stored as a normal file:
-
-```text
-$XDG_CACHE_HOME/codex-telegram-bridge/telegram-media/files/<cache-entry-id>/<telegram-file-name>
-```
-
-Metadata is stored separately from the file content in the media index:
-
-```text
-$XDG_CACHE_HOME/codex-telegram-bridge/telegram-media/.media-index.json
-```
-
-The index stores `mediaId`, the source project, Telegram message aliases, file metadata, trigger results, registered project artifacts, and expiration time. The original Telegram message and the Bridge echo message resolve to the same record.
-
-After saving a non-voice upload, Bridge sends the file back with `Info` and `Delete` controls. A later reply resolves an existing project artifact first and the cache original second. It does not run handlers again.
-
-Codex runs launched by Bridge get `scripts/` on `PATH`, so agents can inspect and register media events:
+Bridge-launched Codex processes receive Bridge scripts on `PATH`:
 
 ```bash
 media-event list
@@ -281,46 +281,161 @@ media-event complete --media-id <mediaId> --project <alias> --path <project-rela
 media-event validate
 ```
 
-Voice and audio messages use the same cached original for both media triggers and STT. Voice transcripts remain direct user prompts; an uploaded audio caption is combined with its transcript. Enable local STT in `.env`:
+## Scheduled Codex tasks
 
-```bash
-STT_COMMAND=scripts/transcribe-faster-whisper
-LOCAL_WHISPER_MODEL=Systran/faster-whisper-small
-LOCAL_WHISPER_LANGUAGE=ru
+`/schedule` opens a dedicated schedule-management session. Tasks are stored persistently in:
+
+```text
+~/.codex-telegram-bridge/state/schedule-tasks.json
 ```
 
-The bridge downloads Telegram `voice`, `audio`, and audio `document` messages, converts them to mono 16 kHz WAV with `ffmpeg`, runs `STT_COMMAND <wav-path>`, and routes the transcript through the same command parser as text messages. `STT_COMMAND` can point to any script or binary that prints transcript text to stdout.
+Example requests and commands:
 
-Optional STT settings:
-
-```bash
-STT_TIMEOUT_MS=120000
-STT_NORMALIZE_AUDIO=true
-MAX_AUDIO_BYTES=20000000
-LOCAL_WHISPER_DEVICE=cpu
-LOCAL_WHISPER_COMPUTE_TYPE=int8
-LOCAL_WHISPER_CPU_THREADS=4
-LOCAL_WHISPER_LOCAL_FILES_ONLY=true
-LOCAL_WHISPER_VAD=true
-LOCAL_WHISPER_BEAM_SIZE=5
+```text
+/schedule
+/schedule every day at 9am check new GitHub issues in the current project
+/edit_task_<id>
+/delete_task_<id>
 ```
 
-`STT_NORMALIZE_AUDIO=true` applies EBU R128 loudness normalization before transcription. This raises quiet speech while limiting peaks; set it to `false` to keep the source level unchanged.
+Each task stores its name, description, cron expression, IANA time zone, linked project, Codex prompt, status, last run, next run, and run count. The active Telegram project becomes the default project for a newly created task.
 
-An OpenAI-compatible fallback script is also available at `scripts/transcribe-openai.js`, but the default setup is local `faster-whisper`.
+The first schedule asks for the user's IANA time zone, persists it, and calculates the difference from the server time zone. Bridge reloads tasks after restart and resumes due work automatically.
 
-## Security Notes
+Agents can manage schedules with:
 
-- Only users in `ALLOWED_USER_IDS` are accepted.
-- No `/exec` or arbitrary shell command endpoint exists.
-- `codex exec` is non-interactive, so this bridge controls safety with explicit `--sandbox` and project allowlists.
-- Set `CODEX_APPROVAL_POLICY=on-request` or use `/approval on-request` if you want Codex to ask before operations it decides need confirmation.
-- Host permissions still come from the Linux user running this bridge. For example, Docker tasks require that user to be in the `docker` group or otherwise have permission to access `/var/run/docker.sock`.
-- Keep `.env` mode `0600`.
-- Prefer a dedicated Linux user and narrow `PROJECT_ALLOWLIST`.
+```bash
+schedule-task list --chat-id <id> --json
+schedule-task set-timezone --chat-id <id> --timezone Europe/Berlin
+schedule-task upsert --chat-id <id> --name daily_issues --title "Daily issues" --description "Check GitHub issues" --cron "0 9 * * *" --timezone Europe/Berlin --project /home/user/project --prompt "Check new issues and summarize them." --status enabled
+schedule-task delete --chat-id <id> --name <task-name-or-id>
+```
 
-## Systemd
+## Configuration and data
 
-Copy `systemd/codex-telegram-bridge.service.example` to a real user service and update paths.
+Installed code is managed by npm. Persistent data is separate:
 
-For the `summer` user layout, use `systemd/codex-bridge.summer.service.example` as the starting point.
+```text
+~/.codex-telegram-bridge/
+├── config.env
+├── projects/
+├── state/
+├── logs/
+└── .venv/
+```
+
+Codex credentials remain in `~/.codex/`. Bridge does not copy or remove Codex or Google Workspace credentials.
+
+Fresh configurations set:
+
+- `CODEX_SKIP_GIT_REPO_CHECK=true`, because the generated default project is not initially a Git repository.
+- `CODEX_SANDBOX=danger-full-access`, so Codex can use global skills and operate on systems without Bubblewrap.
+
+`danger-full-access` gives Codex the same filesystem access as the Linux user running Bridge. Use a dedicated Linux user and switch to `workspace-write` when suitable host sandboxing is available.
+
+Useful service commands:
+
+```bash
+codex-telegram-bridge start
+codex-telegram-bridge stop
+codex-telegram-bridge restart
+codex-telegram-bridge status
+codex-telegram-bridge doctor
+codex-telegram-bridge login
+codex-telegram-bridge add-user --user-id <telegram-id>
+```
+
+Ordinary uninstall disables the service but preserves data. Purge removes Bridge data but never Codex or Google credentials:
+
+```bash
+codex-telegram-bridge uninstall
+codex-telegram-bridge uninstall --purge --yes
+```
+
+## Updating
+
+Install the newest commit from `main`:
+
+```bash
+npm install -g github:Modjaid/telegram_bridge-codex_cli
+codex-telegram-bridge restart
+codex-telegram-bridge doctor
+```
+
+Or pin a release tag:
+
+```bash
+npm install -g github:Modjaid/telegram_bridge-codex_cli#v0.1.5
+```
+
+The unscoped package name `codex-telegram-bridge` on the public npm registry belongs to another project. Do not use `npm update -g codex-telegram-bridge` for this Bridge.
+
+To migrate an old checkout without deleting it:
+
+```bash
+codex-telegram-bridge migrate --from /path/to/old/codex-telegram-bridge
+codex-telegram-bridge doctor
+```
+
+Keep the old checkout until the service, Telegram commands, projects, schedules, Codex authorization, and optional external integrations are verified and backed up.
+
+## Optional CollabMD adapter
+
+Bridge can accept CollabMD-compatible HTTP messages in addition to Telegram long polling.
+
+For CollabMD-only operation:
+
+```bash
+TELEGRAM_ADAPTER_ENABLED=false
+COLLABMD_ADAPTER_ENABLED=true
+```
+
+In that mode, `BOT_TOKEN` and `ALLOWED_USER_IDS` are not required.
+
+## Security
+
+- Only Telegram users in `ALLOWED_USER_IDS` are accepted.
+- There is no `/exec` endpoint and no direct arbitrary-shell Telegram command.
+- Codex runs non-interactively with an explicit sandbox, approval policy, and project allowlist.
+- Host permissions come from the Linux service user; use a dedicated account with minimal privileges.
+- Keep `config.env` and token files at mode `0600`.
+- Keep `PROJECT_ALLOWLIST` narrow.
+- Treat uploaded names, MIME types, captions, binaries, APKs, and archives as untrusted.
+- Do not expose the Bridge or management interfaces publicly without an authenticated proxy and a clear threat model.
+
+## Development
+
+Clone the repository, configure a development environment, and run the checks:
+
+```bash
+git clone https://github.com/Modjaid/telegram_bridge-codex_cli.git
+cd telegram_bridge-codex_cli
+cp .env.example .env
+npm run check
+npm start
+```
+
+Important development settings:
+
+```bash
+TELEGRAM_ADAPTER_ENABLED=true
+BOT_TOKEN=<telegram-bot-token>
+ALLOWED_USER_IDS=<telegram-user-id>
+PROJECT_ALLOWLIST=/absolute/project/path
+PROJECT_CREATE_ROOT=/absolute/projects/root
+PROJECT_COMMANDS=project=/absolute/project/path
+BRIDGE_COMMANDS=/codex,@codex,codex:
+```
+
+If the selected project is not a Git repository, set `CODEX_SKIP_GIT_REPO_CHECK=true`.
+
+Systemd examples are provided in:
+
+```text
+systemd/codex-telegram-bridge.service.example
+systemd/codex-bridge.summer.service.example
+```
+
+## License
+
+MIT
