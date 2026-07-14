@@ -7,6 +7,7 @@ The Bridge runs `codex exec --json`, turns Codex JSONL events into readable prog
 ## What it gives you
 
 - **Simple setup:** install one package and run `codex-telegram-bridge setup`.
+- **Conversational project customization:** create, attach, configure, and remove Bridge projects through ordinary dialog with Codex. The bundled `codex-telegram-bridge` skill encapsulates project registration, slash commands, `AGENTS.md`, and Bridge-specific mechanics so users do not have to manage the integration by hand.
 - **Telegram sessions:** start a fresh thread with `/new` or return to an older project session by replying to one of its messages.
 - **Fast project switching:** `/notes`, `/work`, or another project command changes the active workspace immediately.
 - **Parallel work:** start work in another project while Codex is still running in the first one.
