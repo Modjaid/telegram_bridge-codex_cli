@@ -19,6 +19,7 @@ import { runMediaTriggers } from "./media-triggers.js";
 import { installBundledSkills } from "./bundled-skills.js";
 import { projectSessionStartedText } from "./project-skills.js";
 import { PACKAGE_ROOT, resolveBridgePaths } from "./paths.js";
+import { formatTelegramForward, telegramForwardSource } from "./telegram-forward.js";
 import {
   formatZonedDate,
   getScheduleTask,
@@ -386,34 +387,37 @@ async function handleMessage(message) {
     return;
   }
 
-  const text = (message.text || message.caption || "").trim();
+  const rawText = (message.text || message.caption || "").trim();
+  const forwardSource = telegramForwardSource(message);
+  const text = formatTelegramForward(message, rawText);
+  const commandText = forwardSource ? "" : rawText;
   const audio = getAudioAttachment(message);
   const jsonDocument = getJsonDocumentAttachment(message);
   const voicePrompt = Boolean(message.voice?.file_id);
   const inboxAttachment = getInboxAttachment(message);
   if (!text && !audio && !jsonDocument && !inboxAttachment) return;
 
-  if (text.startsWith("/")) await refreshProjectConfig();
+  if (commandText.startsWith("/")) await refreshProjectConfig();
 
-  if (text && await handlePendingProjectCreateReply(message, text)) return;
+  if (commandText && await handlePendingProjectCreateReply(message, commandText)) return;
 
-  const projectDeleteCommand = parseProjectDeleteCommand(text);
+  const projectDeleteCommand = parseProjectDeleteCommand(commandText);
   if (projectDeleteCommand) {
     await handleProjectDeleteCommand(chatId, projectDeleteCommand, message.message_id);
     return;
   }
 
-  const scheduleCommand = parseScheduleCommand(text);
+  const scheduleCommand = parseScheduleCommand(commandText);
   if (scheduleCommand) {
     await handleScheduleCommandMessage(message, scheduleCommand);
     return;
   }
 
-  if (!text.startsWith("/") && activatePendingScheduleSession(chatId)) {
+  if (!commandText.startsWith("/") && activatePendingScheduleSession(chatId)) {
     bindTelegramMessageToSession(telegramTarget(chatId, getActiveTelegramSessionKey(chatId)), message.message_id);
   }
 
-  const projectCommand = parseProjectCommand(text);
+  const projectCommand = parseProjectCommand(commandText);
   let target = null;
   let session = null;
   if (projectCommand) {
@@ -435,7 +439,7 @@ async function handleMessage(message) {
   }
 
   if (!target || !session) {
-    if (await handleGlobalCommandWithoutSession(chatId, text, message.message_id)) return;
+    if (await handleGlobalCommandWithoutSession(chatId, commandText, message.message_id)) return;
     await sendMessage(
       chatId,
       `No active project session. Start one with a project command, for example:\n${firstProjectCommandExample()}`,
@@ -471,11 +475,15 @@ async function handleMessage(message) {
     }
   }
   if (audio) {
-    await handleAudioMessage(target, session, audio, inboxPath, inboxRecord, { runAsPrompt: voicePrompt || Boolean(text), userText: text });
+    await handleAudioMessage(target, session, audio, inboxPath, inboxRecord, {
+      runAsPrompt: voicePrompt || Boolean(rawText),
+      userText: rawText,
+      forwardSource,
+    });
     return;
   }
   if (jsonDocument) {
-    await handleJsonDocumentMessage(target, session, jsonDocument, message.caption || "", inboxPath, inboxRecord);
+    await handleJsonDocumentMessage(target, session, jsonDocument, text, inboxPath, inboxRecord);
     return;
   }
   if (inboxPath && !text) {
@@ -2278,9 +2286,12 @@ async function handleAudioMessage(target, session, audio, inboxPath = "", inboxR
       upsertMediaRecord(config.mediaCacheRoot, inboxRecord);
     }
 
+    const forwardedTranscript = options.forwardSource
+      ? `Forwarded from ${options.forwardSource}\n${transcript}`
+      : transcript;
     appendHistory(session, {
       role: "user",
-      text: transcript,
+      text: forwardedTranscript,
       adapter: target.adapter,
       media: "audio",
       attachmentPath: inboxPath,
@@ -2289,20 +2300,23 @@ async function handleAudioMessage(target, session, audio, inboxPath = "", inboxR
     });
     saveState();
 
-    const liveHeader = formatAudioPromptLiveHeader(transcript);
+    const liveHeader = formatAudioPromptLiveHeader(forwardedTranscript);
     if (session.pendingAnswer) {
       delete session.pendingAnswer;
       saveState();
-      await runCodex(target, `User answer to your previous question, transcribed from an audio message:\n\n${transcript}`, {
+      await runCodex(target, `User answer to your previous question, transcribed from an audio message:\n\n${forwardedTranscript}`, {
         liveHeader,
         liveMessageId: progress.message_id,
       });
       return;
     }
     if (options.runAsPrompt) {
-      const audioPrompt = options.userText && options.userText !== transcript
+      const audioBody = options.userText && options.userText !== transcript
         ? `Telegram caption:\n${options.userText}\n\nAudio transcript:\n${transcript}`
         : transcript;
+      const audioPrompt = options.forwardSource
+        ? `Forwarded from ${options.forwardSource}\n${audioBody}`
+        : audioBody;
       await runCodex(target, buildTextPrompt(audioPrompt, inboxRecord ? { kind: "attachment", record: inboxRecord, path: resolvedReplyMediaPath(inboxRecord) } : null), {
         liveHeader,
         liveMessageId: progress.message_id,
