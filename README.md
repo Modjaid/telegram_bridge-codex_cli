@@ -30,7 +30,7 @@ The Bridge runs `codex exec --json`, turns Codex JSONL events into readable prog
 Install directly from this GitHub repository:
 
 ```bash
-npm install -g github:Modjaid/telegram_bridge-codex_cli#v0.1.6
+npm install -g github:Modjaid/telegram_bridge-codex_cli#v0.1.7
 codex-telegram-bridge setup
 codex-telegram-bridge doctor
 ```
@@ -366,7 +366,7 @@ codex-telegram-bridge doctor
 Or pin a release tag:
 
 ```bash
-npm install -g github:Modjaid/telegram_bridge-codex_cli#v0.1.6
+npm install -g github:Modjaid/telegram_bridge-codex_cli#v0.1.7
 ```
 
 The unscoped package name `codex-telegram-bridge` on the public npm registry belongs to another project. Do not use `npm update -g codex-telegram-bridge` for this Bridge.
