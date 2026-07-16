@@ -42,6 +42,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 - Keep bundled skill `VERSION` files in sync with material skill changes; startup must preserve an installed version newer than the bundle.
 - `codex-telegram-bridge` is the single bundled skill for project lifecycle and Telegram media workflows. The installer retires the former split skills only through their last bundled version (`1.1.0`) and preserves newer user-maintained versions.
 - Telegram voice prompts reuse the STT progress message as the Codex live progress log to avoid extra `Transcribed` chat messages.
+- Completed Codex live-progress messages are deleted one minute after the final answer is delivered. Pressing `More logs` retains that progress message permanently, even if the user later collapses it with `Less logs`.
 - Forwarded Telegram messages are labeled for Codex as `Forwarded from <name>` followed by their content on the next line. Forwarded content must never be interpreted as a Bridge slash command.
 - STT conversion normalizes speech loudness by default (`STT_NORMALIZE_AUDIO=true`) before producing the mono 16 kHz WAV; deployments can disable it without changing the transcriber.
 - If behavior, config, project handling, service setup, or media flow changes, update this file in the same change.

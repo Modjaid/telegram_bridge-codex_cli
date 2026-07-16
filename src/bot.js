@@ -17,6 +17,7 @@ import {
 } from "./media-index.js";
 import { runMediaTriggers } from "./media-triggers.js";
 import { installBundledSkills } from "./bundled-skills.js";
+import { retainLiveProgress, scheduleLiveProgressDeletion } from "./live-progress-retention.js";
 import { projectSessionStartedText } from "./project-skills.js";
 import { PACKAGE_ROOT, resolveBridgePaths } from "./paths.js";
 import { formatTelegramForward, telegramForwardSource } from "./telegram-forward.js";
@@ -289,6 +290,7 @@ async function handleCallback(query) {
       await answerCallback(query.id, "No live logs");
       return;
     }
+    retainLiveProgress(live);
     live.expanded = !live.expanded;
     if (!live.expanded) live.collapsedLineCount = TOGGLED_COLLAPSED_LIVE_LOG_LINES;
     await answerCallback(query.id, live.expanded ? "More logs" : "Collapsed");
@@ -1259,6 +1261,7 @@ async function runCodex(target, prompt, options = {}) {
       });
       saveState();
       await sendBridgeLong(target, live.final);
+      scheduleCompletedLiveProgressDeletion(live);
       if (looksLikeQuestion(live.final)) {
         await sendBridgeMessage(target, "Codex seems to be waiting for your answer.", { reply_markup: answerKeyboard() });
       }
@@ -1380,6 +1383,15 @@ function findLiveProgress(target, message) {
 
 function liveProgressKey(chatId, messageId) {
   return `${String(chatId || "").trim()}:${String(messageId || "").trim()}`;
+}
+
+function scheduleCompletedLiveProgressDeletion(live) {
+  scheduleLiveProgressDeletion(live, {
+    deleteMessage: deleteTelegramMessage,
+    onSettled: completed => {
+      liveProgressMessages.delete(liveProgressKey(completed.target.chatId, completed.messageId));
+    },
+  });
 }
 
 async function stopRun(target) {
@@ -1769,6 +1781,14 @@ async function answerCallback(callbackQueryId, text) {
     callback_query_id: callbackQueryId,
     text,
   });
+}
+
+async function deleteTelegramMessage(chatId, messageId) {
+  try {
+    await telegram("deleteMessage", { chat_id: chatId, message_id: messageId });
+  } catch (error) {
+    console.warn(`Failed to delete completed Codex progress message ${messageId}: ${error.message}`);
+  }
 }
 
 function telegramTarget(chatId, sessionKey = "") {
