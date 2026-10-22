@@ -38,6 +38,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 - All Bridge-generated Telegram messages and controls must be in English. Project-name prompts use Telegram `ForceReply` so replies are tied to the prompt instead of entering the active Codex session.
 - Project-switch confirmations list global and project-local skills without duplicates, followed by a non-recursive first-level directory listing capped to fit a Telegram message.
 - Telegram media is downloaded once into the shared seven-day XDG cache (`$XDG_CACHE_HOME/codex-telegram-bridge/telegram-media`, or `~/.cache/...`; override with `TELEGRAM_MEDIA_CACHE_ROOT`). Project-specific processing belongs in `.codex/skills/*/telegram-media-trigger.json` plus that skill's scripts; reply resolution must never rerun triggers or STT.
+- For agent requests to send project files to Telegram, the bundled skill uses `scripts/media-index send`; reuse this CLI rather than recreating Telegram API requests, and select the requesting chat explicitly.
 - Register persistent project artifacts with `scripts/media-event complete`; do not hand-edit the shared `.media-index.json`.
 - Keep bundled skill `VERSION` files in sync with material skill changes; startup must preserve an installed version newer than the bundle.
 - `codex-telegram-bridge` is the single bundled skill for project lifecycle and Telegram media workflows. The installer retires the former split skills only through their last bundled version (`1.1.0`) and preserves newer user-maintained versions.

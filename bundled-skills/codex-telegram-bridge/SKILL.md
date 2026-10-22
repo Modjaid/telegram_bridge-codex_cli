@@ -1,6 +1,6 @@
 ---
 name: codex-telegram-bridge
-description: Manage Codex Telegram Bridge projects and Telegram media handling. Use when a user asks to create, attach, register, activate, list, choose, detach, or delete a Bridge project; create or update project AGENTS.md instructions; explain Telegram file storage or retention; or configure project handlers for PDFs, APKs, images, audio, video, documents, archives, MIME types, extensions, one project, several projects, or all projects.
+description: Manage Codex Telegram Bridge projects and Telegram media handling. Use when a user asks to create, attach, register, activate, list, choose, detach, or delete a Bridge project; create or update project AGENTS.md instructions; send a project file back to Telegram; explain Telegram file storage or retention; or configure project handlers for PDFs, APKs, images, audio, video, documents, archives, MIME types, extensions, one project, several projects, or all projects.
 ---
 
 # Codex Telegram Bridge
@@ -10,6 +10,7 @@ Keep Bridge project registration, project instructions, and Telegram media handl
 ## Choose the workflow
 
 - For project creation, attachment, registration, activation, deletion, or instructions, follow **Manage projects**.
+- For requests such as “send me AGENTS.md” or “пришли файл”, follow **Send a file to Telegram**.
 - For file storage questions or upload handlers, follow **Handle Telegram media**.
 - When a media request needs a missing project, complete the project workflow first and then continue with the media workflow.
 
@@ -88,6 +89,23 @@ After either operation, run `project-manager list` again and verify that the ali
 4. Report the slash command. Sending it activates that project as current.
 
 The running Bridge refreshes project configuration before slash commands, so do not restart merely to expose a new project. Never hand-edit `config.env` for project lifecycle operations.
+
+## Send a file to Telegram
+
+Use the existing `scripts/media-index send` command; do not reconstruct multipart requests, read bot tokens, or search the Bridge source for sending code. A request to send a named file authorizes that delivery to the requesting chat.
+
+Resolve the installed package from its executable (or reuse an already known Bridge root):
+
+```bash
+bridge_root="$(dirname "$(dirname "$(readlink -f "$(command -v codex-telegram-bridge)")")")"
+node "$bridge_root/scripts/media-index" send AGENTS.md --project "$PWD" --chat-id <requesting-chat-id> --json
+```
+
+Replace `AGENTS.md` with the requested project-relative path, absolute path, or registered `mediaId`. Use `--caption <text>` only when needed. The command loads the user's Bridge configuration, registers local files, sends the document, and records its Telegram message alias. Run it once and report success only when the result has `ok: true` and a `messageId`.
+
+Use the requesting chat ID from available session context. If absent, inspect only session metadata in the target user's Bridge `state/state.json` for the current project and request; do not print conversation histories. Omit `--chat-id` only after verifying that configuration has exactly one allowed user and it is the requester: the existing command otherwise falls back to the media's original chat or the first allowed user. If the destination remains ambiguous, ask instead of guessing.
+
+Use the owning user's Bridge environment; `CODEX_TELEGRAM_BRIDGE_HOME` or `CODEX_TELEGRAM_BRIDGE_CONFIG` selects non-default configuration. If the executable is absent from `PATH`, locate its installed package once and reuse that path. A local Markdown link alone does not deliver a Telegram attachment. If delivery fails or its outcome is uncertain, inspect the error before retrying to avoid duplicate messages. Do not send another test copy of the user's file merely to validate skill edits.
 
 ## Handle Telegram media
 
