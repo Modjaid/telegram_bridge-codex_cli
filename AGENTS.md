@@ -10,7 +10,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 - `src/paths.js` centralizes installed-package and persistent-data paths; `src/cli.js` implements the npm CLI.
 - `src/media-index.js` - locked, atomic shared media-cache index helpers.
 - `src/media-triggers.js` - discovers and runs project-skill media subscriptions.
-- `src/bundled-skills.js` and `bundled-skills/` - versioned skills installed into the service user's Codex home at Bridge startup.
+- `src/bundled-skills.js` and `bundled-skills/` - versioned skills installed into registered projects under `.codex/skills/` at startup and project registration.
 - `scripts/media-event` - CLI for inspecting events and registering persistent project artifacts.
 - `.env.example` - supported config knobs.
 - `systemd/*.service.example` - service templates.
@@ -40,6 +40,7 @@ Node.js bridge for Codex CLI. It reads `.env`, accepts Telegram long-polling upd
 - Telegram media is downloaded once into the shared seven-day XDG cache (`$XDG_CACHE_HOME/codex-telegram-bridge/telegram-media`, or `~/.cache/...`; override with `TELEGRAM_MEDIA_CACHE_ROOT`). Project-specific processing belongs in `.codex/skills/*/telegram-media-trigger.json` plus that skill's scripts; reply resolution must never rerun triggers or STT.
 - For agent requests to send project files to Telegram, the bundled skill uses `scripts/media-index send`; reuse this CLI rather than recreating Telegram API requests, and select the requesting chat explicitly.
 - Register persistent project artifacts with `scripts/media-event complete`; do not hand-edit the shared `.media-index.json`.
+- Install the Bridge skill only in registered projects. Preserve newer or modified copies; detach removes only unchanged copies tracked by `.bridge-install.json`. Archive former global copies outside `skills/` after project migration.
 - Keep bundled skill `VERSION` files in sync with material skill changes; startup must preserve an installed version newer than the bundle.
 - `codex-telegram-bridge` is the single bundled skill for project lifecycle and Telegram media workflows. The installer retires the former split skills only through their last bundled version (`1.1.0`) and preserves newer user-maintained versions.
 - Telegram voice prompts reuse the STT progress message as the Codex live progress log to avoid extra `Transcribed` chat messages.

@@ -156,10 +156,10 @@ Never hand-edit project registration when `project-manager` can perform the oper
 
 ## Bundled Codex skill
 
-Bridge installs one global skill at startup:
+Bridge installs its skill locally in each registered project:
 
 ```text
-~/.codex/skills/codex-telegram-bridge/
+<connected-project>/.codex/skills/codex-telegram-bridge/
 ```
 
 The skill teaches Codex how to:
@@ -171,7 +171,7 @@ The skill teaches Codex how to:
 - explain Telegram media storage and retention;
 - create and validate project-local media handlers.
 
-The bundled skill is versioned and upgrades atomically. During migration, bundled versions up to `1.1.0` of the former `configure-telegram-media` and `manage-telegram-projects` skills are retired. Newer user-maintained versions are preserved.
+The bundled skill is installed only in registered projects, when created or attached and at Bridge startup/config refresh. It is versioned and upgrades atomically. Newer or locally modified project copies are preserved. Detaching a project removes only an unchanged Bridge-managed copy. The former global skills are moved to `~/.codex/bridge-skill-backups/` after all registered projects have local copies, preserving their contents outside skill discovery. During migration, bundled versions up to `1.1.0` of the former `configure-telegram-media` and `manage-telegram-projects` skills are retired. Newer user-maintained versions are preserved.
 
 ## Voice messages and local STT
 

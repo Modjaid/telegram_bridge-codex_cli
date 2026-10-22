@@ -33,6 +33,8 @@ try {
   const projectName = path.basename(home).toLowerCase().replace(/[^a-z0-9_]+/g, "_");
   const defaultProject = path.join(paths.projectsRoot, projectName);
   assert.ok(existsSync(path.join(defaultProject, "AGENTS.md")));
+  assert.ok(existsSync(path.join(defaultProject, ".codex", "skills", "codex-telegram-bridge", "SKILL.md")));
+  assert.equal(existsSync(path.join(home, ".codex", "skills", "codex-telegram-bridge")), false);
   assert.equal(statSync(path.join(defaultProject, "AGENTS.md")).mode & 0o777, 0o600);
   const first = readFileSync(paths.configFile, "utf8");
   const codexBin = resolveCommand("codex");

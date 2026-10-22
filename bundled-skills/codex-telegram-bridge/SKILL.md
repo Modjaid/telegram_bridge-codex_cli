@@ -88,6 +88,8 @@ After either operation, run `project-manager list` again and verify that the ali
 3. Confirm `AGENTS.md` exists and contains only approved instructions.
 4. Report the slash command. Sending it activates that project as current.
 
+The Bridge installs this skill in each registered project at `.codex/skills/codex-telegram-bridge/`, updating unchanged managed copies by version. Newer or modified copies are preserved. Detach removes only an unchanged managed copy; former global copies are archived outside skill discovery.
+
 The running Bridge refreshes project configuration before slash commands, so do not restart merely to expose a new project. Never hand-edit `config.env` for project lifecycle operations.
 
 ## Send a file to Telegram

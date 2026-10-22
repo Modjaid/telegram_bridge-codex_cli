@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { installBundledSkills, removeProjectBundledSkills } from "../src/bundled-skills.js";
 import { resolveBridgePaths } from "../src/paths.js";
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
@@ -51,6 +52,7 @@ function main() {
       writeFileSync(agentsPath, defaultAgentsMd(alias), { mode: 0o600 });
     }
 
+    installBundledSkills(ROOT, { projects: [project], migrateGlobal: false });
     projects.push(project);
     commands.set(alias, project);
     writeProjectEnv(env, projects, commands, createRoot);
@@ -85,6 +87,7 @@ function main() {
       writeFileSync(agentsPath, defaultAgentsMd(alias), { mode: 0o600 });
     }
 
+    installBundledSkills(ROOT, { projects: [project], migrateGlobal: false });
     projects.push(project);
     commands.set(alias, project);
     writeProjectEnv(env, projects, commands, createRoot);
@@ -121,7 +124,9 @@ function main() {
       if (path.resolve(commandProject) === path.resolve(previous)) commands.set(commandAlias, project);
     }
     commands.set(alias, project);
+    installBundledSkills(ROOT, { projects: [project], migrateGlobal: false });
     writeProjectEnv(env, nextProjects, commands, createRoot);
+    if (path.resolve(previous) !== project) removeProjectBundledSkills(previous);
     return print({ ok: true, action: "repointed", alias, previous, project, agentsPath, createRoot, projects: nextProjects, projectCommands: Object.fromEntries(commands) });
   }
 
@@ -138,6 +143,7 @@ function main() {
     if (remainingProjects.length === 0) throw new Error("Cannot delete the last allowed project.");
     const folderRemoved = isInside(BRIDGE_PATHS.projectsRoot, project);
     if (folderRemoved) rmSync(project, { recursive: true, force: true });
+    else removeProjectBundledSkills(project);
     writeProjectEnv(env, remainingProjects, commands, createRoot);
     return print({
       ok: true,
@@ -163,6 +169,7 @@ function main() {
     const remainingProjects = projects.filter(item => path.resolve(item) !== path.resolve(project));
     if (remainingProjects.length === 0) throw new Error("Cannot detach the last allowed project.");
     writeProjectEnv(env, remainingProjects, commands, createRoot);
+    removeProjectBundledSkills(project);
     return print({ ok: true, action: "detached", alias, project, folderRemoved: false, createRoot, projects: remainingProjects, projectCommands: Object.fromEntries(commands) });
   }
 

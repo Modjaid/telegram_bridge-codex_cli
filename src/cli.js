@@ -1,3 +1,4 @@
+import { installBundledSkills } from "./bundled-skills.js";
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -79,6 +80,7 @@ async function configure(args, io) {
     return;
   }
   safeWriteConfig(paths.configFile, serializeEnv(env));
+  installBundledSkills(PACKAGE_ROOT, { projects: env.PROJECT_ALLOWLIST.split(",").filter(Boolean), codexHome: process.env.CODEX_HOME || path.join(paths.home, ".codex") });
   io.out(`Configuration ready: ${paths.configFile}`);
 }
 

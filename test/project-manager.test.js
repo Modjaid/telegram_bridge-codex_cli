@@ -64,6 +64,20 @@ assert.match(config, new RegExp(`PROJECT_COMMANDS=keep=${escapeRegex(keepProject
 assert.doesNotMatch(config, /delete_me/);
 assert.doesNotMatch(config, /external_project/);
 
+const invoke = (...args) => JSON.parse(execFileSync(process.execPath, [path.resolve("scripts/project-manager"), ...args], {
+  encoding: "utf8", env: { ...process.env, CODEX_TELEGRAM_BRIDGE_HOME: root, CODEX_TELEGRAM_BRIDGE_CONFIG: configFile },
+}));
+const created = invoke("create", "--name", "local_skill");
+const skill = path.join(created.project, ".codex", "skills", "codex-telegram-bridge");
+assert.ok(existsSync(path.join(skill, "SKILL.md")));
+invoke("detach", "--name", "local_skill");
+assert.equal(existsSync(skill), false);
+assert.ok(existsSync(created.project));
+invoke("add", "--name", "local_skill", "--path", created.project);
+writeFileSync(path.join(skill, "SKILL.md"), "custom project instructions\n");
+invoke("detach", "--name", "local_skill");
+assert.equal(readFileSync(path.join(skill, "SKILL.md"), "utf8"), "custom project instructions\n");
+
 console.log("project-manager tests: OK");
 
 function escapeRegex(value) {

@@ -2826,6 +2826,7 @@ function applyProjectManagerResult(result) {
   const commandEntries = Object.entries(result.projectCommands || {});
   if (!projects.length) throw new Error("project-manager returned no projects");
 
+  installBundledSkills(ROOT, { projects });
   config.projects = projects;
   config.projectCreateRoot = path.resolve(result.createRoot || config.projectCreateRoot);
   config.projectCommandSpec = commandEntries.map(([alias, project]) => `${alias}=${path.resolve(project)}`).join(",");
